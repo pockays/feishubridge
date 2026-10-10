@@ -17,7 +17,9 @@ import { anthropicTools, executeTool } from './tools.js'
  *      and re-send
  *   3. otherwise return the final text
  *
- * Capped at MAX_TOOL_ITERATIONS to prevent runaway loops.
+ * Capped at MAX_TOOL_ITERATIONS to prevent runaway loops. The last iteration is
+ * sent WITHOUT tool definitions, which forces the model to answer with whatever
+ * it has already gathered instead of ending the turn with "hit the cap".
  */
 
 const client = new Anthropic({
@@ -25,7 +27,7 @@ const client = new Anthropic({
   authToken: config.ANTHROPIC_AUTH_TOKEN,
 })
 
-const MAX_TOOL_ITERATIONS = 6
+const MAX_TOOL_ITERATIONS = config.MAX_TOOL_ITERATIONS
 
 export interface ChatMessage {
   role: 'user' | 'assistant'
@@ -40,7 +42,12 @@ export interface ChatResult {
   toolCalls: number
 }
 
-const SYSTEM_PROMPT = `You are a helpful Feishu/Lark assistant connected to the user via a bot bridge. Reply in the same language as the user's message. When the user asks about specific chats, documents, or tables they have access to, use the provided tools to fetch real data rather than guessing. Keep replies concise — this is a chat UI.`
+const SYSTEM_PROMPT = `You are a helpful Feishu/Lark assistant connected to the user via a bot bridge. Reply in the same language as the user's message. When the user asks about specific chats, documents, or tables they have access to, use the provided tools to fetch real data rather than guessing.
+
+Be economical with tools — this is a chat UI and the user is waiting:
+- Search first, then read only the 1-3 most relevant hits. Do NOT read every result.
+- The moment you have enough to answer, stop calling tools and write the answer.
+- If a tool returns nothing useful after two attempts, say so plainly instead of trying more variations.`
 
 export async function chat(history: ChatMessage[]): Promise<ChatResult> {
   // Anthropic SDK uses MessageParam[] which accepts string content for the
@@ -57,11 +64,13 @@ export async function chat(history: ChatMessage[]): Promise<ChatResult> {
   let modelEcho = config.ANTHROPIC_MODEL
 
   for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+    // 最后一轮不带工具：模型想再查也查不了，只能把已有信息整理成回答。
+    const isLastIteration = iter === MAX_TOOL_ITERATIONS - 1
     const resp = await client.messages.create({
       model: config.ANTHROPIC_MODEL,
       max_tokens: config.MAX_TOKENS_REPLY,
       system: SYSTEM_PROMPT,
-      ...(config.ENABLE_TOOLS ? { tools: anthropicTools() } : {}),
+      ...(config.ENABLE_TOOLS && !isLastIteration ? { tools: anthropicTools() } : {}),
       messages,
     })
 
@@ -69,10 +78,10 @@ export async function chat(history: ChatMessage[]): Promise<ChatResult> {
     totalOut += resp.usage.output_tokens
     modelEcho = resp.model
 
-    if (resp.stop_reason !== 'tool_use') {
+    if (resp.stop_reason !== 'tool_use' || isLastIteration) {
       finalText = extractText(resp.content)
       logger.debug(
-        { iter, in: totalIn, out: totalOut, toolCalls, stop: resp.stop_reason },
+        { iter, in: totalIn, out: totalOut, toolCalls, stop: resp.stop_reason, last: isLastIteration },
         'chat done',
       )
       break
@@ -107,7 +116,8 @@ export async function chat(history: ChatMessage[]): Promise<ChatResult> {
   }
 
   if (!finalText) {
-    finalText = `(reached tool-use iteration cap of ${MAX_TOOL_ITERATIONS} without a final answer)`
+    finalText =
+      '我查了几轮还没能给出结论（工具调用次数用尽）。可以再问一次，或者把范围说具体一点——比如直接给我文档/表格的名字。'
   }
 
   return {

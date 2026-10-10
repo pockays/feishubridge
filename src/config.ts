@@ -15,6 +15,13 @@ const Env = z.object({
   MAX_HISTORY_TURNS: z.coerce.number().int().positive().default(12),
   MAX_TOKENS_REPLY: z.coerce.number().int().positive().default(1024),
 
+  /**
+   * 一轮对话里最多允许模型调用几轮工具。
+   * 最后一轮会**不带工具**发出去，逼模型拿已有信息给结论 —— 否则它会一直查到
+   * 上限然后回一句 "(reached tool-use iteration cap)"，用户什么也拿不到。
+   */
+  MAX_TOOL_ITERATIONS: z.coerce.number().int().min(2).max(20).default(8),
+
   STORE_PATH: z.string().min(1).default('data/bridge.sqlite'),
   SEEN_EVENT_TTL_DAYS: z.coerce.number().int().positive().default(7),
 
