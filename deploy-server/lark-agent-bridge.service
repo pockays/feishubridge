@@ -1,0 +1,30 @@
+[Unit]
+Description=Lark Agent Bridge (Feishu bot <-> LLM)
+Documentation=https://github.com/lizhihao-leo/lark-agent-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/lark-agent-bridge
+ExecStart=/usr/local/bin/node /opt/lark-agent-bridge/dist/index.js
+
+# 挂掉自动拉起
+Restart=always
+RestartSec=5
+
+# lark-cli 安装在 /usr/local/bin，必须显式给 PATH
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# 环境不继承宿主 shell，日志写文件便于排查
+StandardOutput=append:/var/log/lark-agent-bridge/bridge.out.log
+StandardError=append:/var/log/lark-agent-bridge/bridge.err.log
+
+# 轻量加固
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+# 跨平台换行：Linux 侧脚本必须保持 LF，否则部署到服务器会执行失败
+* text=auto
+
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.service   text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+*.ps1       text eol=crlf
+*.cmd       text eol=crlf
+*.bat       text eol=crlf

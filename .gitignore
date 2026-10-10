@@ -20,6 +20,10 @@ data/
 *.sqlite
 *.sqlite-journal
 
+# lark-cli 应用凭证目录（含明文 app secret，切勿提交）
+lark-cli-config/
+LARKSUITE_CLI_APP_SECRET
+
 # coverage / cache
 coverage/
 .cache/

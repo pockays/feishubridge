@@ -1,0 +1,11 @@
+node_modules
+dist
+data
+.env
+.git
+.github
+*.log
+bridge.out.log
+bridge.err.log
+deploy-server
+docs

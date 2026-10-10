@@ -1,0 +1,29 @@
+# 服务器侧 docker-compose（放在 /opt/lark-agent-bridge/docker-compose.yml）
+services:
+  lark-agent-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lark-agent-bridge:latest
+    container_name: lark-agent-bridge
+    restart: unless-stopped
+
+    # 模型 key / 模型名等配置
+    env_file:
+      - .env
+
+    volumes:
+      # 会话历史 + 事件去重（持久化，删了只丢上下文）
+      - ./data:/app/data
+      # lark-cli 的应用配置与令牌（app_id / app_secret 在这里）
+      - ./lark-cli-config:/root/.lark-cli
+
+    # 内存护栏：即便异常也只影响自己，不会拖垮 MySQL 等业务容器
+    mem_limit: 384m
+    memswap_limit: 768m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

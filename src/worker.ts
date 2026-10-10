@@ -1,8 +1,8 @@
 import { config } from './config.js'
 import { logger } from './logger.js'
 import { startConsumer } from './lark/consume.js'
-import { reply, recall, replyImage } from './lark/reply.js'
-import { react } from './lark/reactions.js'
+import { respond as respondApi, respondImage as respondImageApi, recall } from './lark/reply.js'
+import { react, unreact } from './lark/reactions.js'
 import { extractLocalImages } from './lark/images.js'
 import { buildCard, type CardPhase, type ToolEntry } from './lark/card.js'
 import { sendCardReply, CardPatcher } from './lark/card-send.js'
@@ -15,6 +15,109 @@ import { downloadResource } from './lark/download.js'
 import { startMetricsServer, metrics } from './metrics.js'
 import { parseCommand, isSandboxOff } from './commands.js'
 import type { FeishuMessageEvent } from './lark/types.js'
+
+/**
+ * 回复的呈现形式由 config.RESPONSE_MODE 决定：
+ *   - 'reply'  : 引用式回复，挂在用户那条消息下面（默认）
+ *   - 'thread' : 话题回复，折叠成「N 条回复」入口
+ *   - 'send'   : 独立消息，直接出现在主消息流里
+ *   - 'auto'   : 私聊不 @ → 普通消息；私聊 @ → 引用回复；
+ *                群聊 @ → 话题；已在话题内 → 回到同一话题（优先级最高）
+ */
+function responseMode(evt: FeishuMessageEvent): 'send' | 'reply' | 'thread' {
+  switch (config.RESPONSE_MODE) {
+    case 'send':
+      return 'send'
+    case 'reply':
+      return 'reply'
+    case 'thread':
+      return 'thread'
+    case 'auto': {
+      // ① 已经在话题里（用户点进话题继续追问）→ 必须回到同一个话题里回复，
+      //    否则回复会掉到主会话流，看起来像"跑到了私聊窗口"。
+      if (evt.thread_id || evt.root_id) return 'thread'
+
+      const mentioned = isMentioned(evt)
+
+      // ② 私聊：不带 @ → 普通消息；带 @ → 引用回复（挂在用户消息下）
+      if (evt.chat_type === 'p2p') return mentioned ? 'reply' : 'send'
+
+      // ③ 群聊：带 @ → 话题；未 @（若触发限制被放开）→ 普通消息
+      return mentioned ? 'thread' : 'send'
+    }
+  }
+}
+
+/**
+ * 判断消息里有没有 @。
+ *
+ * 主判据是文本前缀（lark-cli 会把 @机器人 规范成以 '@' 开头的文本，群消息
+ * 的触发判断也用同一套语义）；另外用事件自带的 `mentions` 兜底，覆盖
+ * "先打字、@ 不在开头"的情况。
+ */
+function isMentioned(evt: FeishuMessageEvent): boolean {
+  if (String(evt.content ?? '').trimStart().startsWith('@')) return true
+  return Array.isArray(evt.mentions) && evt.mentions.length > 0
+}
+
+function respond(
+  evt: FeishuMessageEvent,
+  opts: { messageId: string; body: string; format?: 'text' | 'markdown' },
+) {
+  return respondApi({
+    messageId: opts.messageId,
+    chatId: evt.chat_id,
+    mode: responseMode(evt),
+    body: opts.body,
+    ...(opts.format ? { format: opts.format } : {}),
+  }).then((r) => {
+    if (r.ok) void clearAck(opts.messageId)
+    return r
+  })
+}
+
+function respondImage(
+  evt: FeishuMessageEvent,
+  opts: { messageId: string; image: string; cwd?: string },
+) {
+  return respondImageApi({
+    messageId: opts.messageId,
+    chatId: evt.chat_id,
+    mode: responseMode(evt),
+    image: opts.image,
+    ...(opts.cwd ? { cwd: opts.cwd } : {}),
+  }).then((r) => {
+    if (r.ok) void clearAck(opts.messageId)
+    return r
+  })
+}
+
+/**
+ * 已发出的"正在思考"表情回应：message_id → reaction_id。
+ * 回复成功发出后按 message_id 撤回，避免提示一直挂着。
+ */
+const ackReactions = new Map<string, string>()
+
+/** 加一个 ack 表情，并记下 reaction_id 以便稍后撤回。 */
+function ackReact(evt: FeishuMessageEvent, emojiType: string): void {
+  void react(evt.message_id, emojiType).then((reactionId) => {
+    if (!reactionId) return
+    if (ackReactions.size > 500) {
+      // 简单封顶，防止长期运行内存无限增长
+      const oldest = ackReactions.keys().next().value
+      if (oldest) ackReactions.delete(oldest)
+    }
+    ackReactions.set(evt.message_id, reactionId)
+  })
+}
+
+/** 撤回某条消息上的 ack 表情（如果之前加过）。 */
+async function clearAck(messageId: string): Promise<void> {
+  const reactionId = ackReactions.get(messageId)
+  if (!reactionId) return
+  ackReactions.delete(messageId)
+  await unreact(messageId, reactionId)
+}
 
 const store = new Store(config.STORE_PATH)
 const startedAtMs = Date.now()
@@ -68,6 +171,19 @@ function shouldHandleGroup(content: string): boolean {
   }
 }
 
+/**
+ * 是否要响应该消息。
+ *
+ *   - 私聊：一律响应
+ *   - 群里且在话题内：按私聊处理，**不要求 @**（用户明确要求）
+ *   - 群里且不在话题内：按 GROUP_TRIGGER 判断（默认需要 @）
+ */
+function shouldHandle(evt: FeishuMessageEvent): boolean {
+  if (evt.chat_type !== 'group') return true
+  if (evt.thread_id || evt.root_id) return true
+  return shouldHandleGroup(String(evt.content ?? ''))
+}
+
 /** Strip the bot's @-mention prefix so the LLM doesn't see it. */
 function stripMention(content: string): string {
   let s = content.trimStart()
@@ -112,9 +228,9 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
   // and synthesise a text prompt that points the agent at it via Read.
   // Other non-text types are still politely refused.
   if (evt.message_type === 'image' || evt.message_type === 'file') {
-    if (isGroup && !shouldHandleGroup(rawContent)) return
+    if (!shouldHandle(evt)) return
     if (config.BACKEND !== 'claude-code') {
-      await reply({
+      await respond(evt, {
         messageId: evt.message_id,
         body: `(${evt.message_type === 'image' ? '图片' : '文件'}输入仅在 \`BACKEND=claude-code\` 后端下支持)`,
         format: 'markdown',
@@ -130,7 +246,7 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
   // the user we don't speak that yet. Surface to the log so operators
   // can see what's being silently refused.
   if (evt.message_type !== 'text') {
-    if (isGroup && !shouldHandleGroup(rawContent)) {
+    if (!shouldHandle(evt)) {
       metrics.messagesDropped.inc({ reason: 'group_filter' })
       return
     }
@@ -139,7 +255,7 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
       'unsupported message type, replying with refusal',
     )
     metrics.messagesDropped.inc({ reason: 'unsupported_type' })
-    await reply({
+    await respond(evt, {
       messageId: evt.message_id,
       body: `(暂不支持 \`${evt.message_type}\` 类型消息,当前版本支持文本、图片和文件。)`,
       format: 'markdown',
@@ -148,8 +264,16 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
   }
 
   // Group filter.
-  if (isGroup && !shouldHandleGroup(rawContent)) {
-    logger.debug({ chat: evt.chat_id, preview: rawContent.slice(0, 40) }, 'group msg ignored')
+  if (!shouldHandle(evt)) {
+    logger.debug(
+      {
+        chat: evt.chat_id,
+        preview: rawContent.slice(0, 40),
+        thread: evt.thread_id,
+        mentions: Array.isArray(evt.mentions) ? evt.mentions.length : 0,
+      },
+      'group msg ignored',
+    )
     metrics.messagesDropped.inc({ reason: 'group_filter' })
     return
   }
@@ -171,7 +295,7 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
   // system command ran.
   const cmd = parseCommand(userText)
   if (cmd) {
-    if (config.ACK_EMOJI) void react(evt.message_id, config.ACK_EMOJI)
+    if (config.ACK_EMOJI) ackReact(evt, config.ACK_EMOJI)
     logger.info(
       { chat: evt.chat_id, from: evt.sender_id, command: cmd.def.name, args: cmd.args },
       'functional command',
@@ -187,10 +311,10 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
       if (result.contextNote) {
         store.appendMessage(evt.chat_id, 'user', result.contextNote)
       }
-      await reply({ messageId: evt.message_id, body: result.reply, format: 'markdown' })
+      await respond(evt, { messageId: evt.message_id, body: result.reply, format: 'markdown' })
     } catch (err) {
       logger.error({ err, command: cmd.def.name }, 'command handler threw')
-      await reply({
+      await respond(evt, {
         messageId: evt.message_id,
         body: `(命令 \`/${cmd.def.name}\` 执行失败)`,
         format: 'text',
@@ -207,6 +331,10 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
       chatType: evt.chat_type,
       from: evt.sender_id,
       preview: userText.slice(0, 80),
+        thread: evt.thread_id,
+        root: evt.root_id,
+        replyTo: evt.reply_to,
+        mentions: Array.isArray(evt.mentions) ? evt.mentions.length : 0,
     },
     'incoming message',
   )
@@ -241,7 +369,7 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
   if (/[`*#>\-_]|\n/.test(body)) format = 'markdown'
 
   store.appendMessage(evt.chat_id, 'assistant', body)
-  await reply({ messageId: evt.message_id, body, format })
+  await respond(evt, { messageId: evt.message_id, body, format })
 }
 
 /**
@@ -256,15 +384,15 @@ async function admitAndAck(evt: FeishuMessageEvent): Promise<boolean> {
     const wait = Math.ceil(limit.retryAfterSec ?? 10)
     logger.warn({ sender: evt.sender_id, retryAfterSec: wait }, 'rate-limited')
     metrics.messagesDropped.inc({ reason: 'rate_limited' })
-    void react(evt.message_id, 'CLOCK')
-    await reply({
+    ackReact(evt, 'CLOCK')
+    await respond(evt, {
       messageId: evt.message_id,
       body: `⏰ 请求过于频繁,请约 ${wait} 秒后再试(每用户每分钟 ${config.RATE_PER_USER_PER_MIN} 条)。`,
       format: 'text',
     })
     return false
   }
-  if (config.ACK_EMOJI) void react(evt.message_id, config.ACK_EMOJI)
+  if (config.ACK_EMOJI) ackReact(evt, config.ACK_EMOJI)
   return true
 }
 
@@ -289,7 +417,7 @@ async function handleResourceMessage(
       { chat: evt.chat_id, kind, preview: rawContent.slice(0, 80) },
       `${kind} message: no key found in content`,
     )
-    await reply({
+    await respond(evt, {
       messageId: evt.message_id,
       body: `(无法从消息中提取 ${kind === 'image' ? 'image_key' : 'file_key'},请重试)`,
       format: 'text',
@@ -322,7 +450,7 @@ async function handleResourceMessage(
     as: 'bot',
   })
   if (!dl.ok) {
-    await reply({
+    await respond(evt, {
       messageId: evt.message_id,
       body: `(${kind === 'image' ? '图片' : '文件'}下载失败,请稍后再试)`,
       format: 'text',
@@ -377,7 +505,7 @@ async function handleClaudeCode(evt: FeishuMessageEvent, userText: string): Prom
   // ---- Legacy text path ----
   let placeholderId: string | undefined
   if (config.SHOW_THINKING_PLACEHOLDER) {
-    const r = await reply({
+    const r = await respond(evt, {
       messageId: evt.message_id,
       body: '⏳ 思考中…',
       format: 'text',
@@ -438,14 +566,14 @@ async function handleClaudeCode(evt: FeishuMessageEvent, userText: string): Prom
 
   const textBody = stripped.trim()
   if (textBody) {
-    await reply({ messageId: evt.message_id, body: textBody, format })
+    await respond(evt, { messageId: evt.message_id, body: textBody, format })
   } else if (images.length === 0) {
-    await reply({ messageId: evt.message_id, body: '(空回复)', format: 'text' })
+    await respond(evt, { messageId: evt.message_id, body: '(空回复)', format: 'text' })
   }
 
   for (const img of images) {
     logger.info({ chat: evt.chat_id, image: img.relPath, alt: img.alt }, 'sending image reply')
-    const r = await replyImage({
+    const r = await respondImage(evt, {
       messageId: evt.message_id,
       image: img.relPath,
       cwd: config.CLAUDE_CODE_SANDBOX,
@@ -590,7 +718,7 @@ async function tryStreamingCard(
   // 4. Image replies still go as separate messages (Phase 8 unchanged).
   for (const img of images) {
     logger.info({ chat: evt.chat_id, image: img.relPath, alt: img.alt }, 'sending image reply')
-    const r = await replyImage({
+    const r = await respondImage(evt, {
       messageId: evt.message_id,
       image: img.relPath,
       cwd: config.CLAUDE_CODE_SANDBOX,

@@ -29,6 +29,16 @@ const Env = z.object({
    */
   GROUP_TRIGGER: z.enum(['mention', 'all', 'off']).default('mention'),
 
+  /**
+   * 回复的呈现形式：
+   *   - 'reply'  : 引用式回复，挂在用户那条消息下面（默认）
+   *   - 'thread' : 话题回复，折叠成「N 条回复」入口
+   *   - 'send'   : 独立消息，直接出现在主消息流里
+   *   - 'auto'   : 私聊不 @ → 普通消息；私聊 @ → 引用回复；
+   *                群聊 @ → 话题；已在话题内 → 回到同一话题（覆盖以上）
+   */
+  RESPONSE_MODE: z.enum(['send', 'reply', 'thread', 'auto']).default('reply'),
+
   /** Optional bot display-name prefix to strip from group content before sending to LLM. */
   BOT_AT_PREFIX: z.string().default(''),
 
