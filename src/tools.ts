@@ -10,6 +10,10 @@ import { logger } from './logger.js'
  * The whitelist below covers the high-value read paths plus one carefully
  * scoped write path (`lark_send_text`) that requires an already-known
  * `chat_id` — the LLM cannot enumerate chats to discover targets.
+ *
+ * Identity note: every tool runs `--as bot`. The server deployment only has
+ * app credentials (app_id / app_secret) and no user OAuth session, so tools
+ * pinned to `--as user` would fail there. Keep new tools on bot identity.
  */
 
 export interface ToolDef {
@@ -59,7 +63,7 @@ export const TOOLS: ToolDef[] = [
       required: ['query'],
     },
     run: async (input) => {
-      const argv = ['im', '+messages-search', '--as', 'user', '--query', str(input, 'query')]
+      const argv = ['im', '+messages-search', '--as', 'bot', '--query', str(input, 'query')]
       const limit = numOpt(input, 'limit')
       if (limit !== undefined) argv.push('--page-size', String(Math.min(50, Math.max(1, limit))))
       const r = await runCli(argv)
@@ -82,7 +86,7 @@ export const TOOLS: ToolDef[] = [
       const chatId = strOpt(input, 'chat_id')
       const userId = strOpt(input, 'user_id')
       if (!chatId && !userId) throw new Error('chat_id or user_id is required')
-      const argv = ['im', '+chat-messages-list', '--as', 'user']
+      const argv = ['im', '+chat-messages-list', '--as', 'bot']
       if (chatId) argv.push('--chat-id', chatId)
       else if (userId) argv.push('--user-id', userId)
       const limit = numOpt(input, 'limit')
@@ -94,24 +98,16 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'lark_doc_read',
     description:
-      'Fetch the plain-text content of a Feishu Docs document by its token. Useful when the user pastes a docs link and asks about its content.',
+      'Fetch the content of a Feishu docx document. Accepts a document URL or token (e.g. https://thedream.feishu.cn/docx/XXXX or the bare token). Use it when the user pastes a doc link or asks about a document found via lark_search_docs.',
     input_schema: {
       type: 'object',
       properties: {
-        document_id: { type: 'string', description: 'Document token (the alphanumeric ID in the URL)' },
+        document: { type: 'string', description: 'Document URL or token' },
       },
-      required: ['document_id'],
+      required: ['document'],
     },
     run: async (input) => {
-      const id = str(input, 'document_id')
-      const r = await runCli([
-        'docs',
-        '+document-raw-content',
-        '--as',
-        'user',
-        '--document-id',
-        id,
-      ])
+      const r = await runCli(['docs', '+fetch', '--as', 'bot', '--doc', str(input, 'document')])
       return r.ok ? r.data : { error: r.stderr || r.raw, exit: r.exitCode }
     },
   },
@@ -133,7 +129,7 @@ export const TOOLS: ToolDef[] = [
         'base',
         '+record-search',
         '--as',
-        'user',
+        'bot',
         '--app-token',
         str(input, 'app_token'),
         '--table-id',
@@ -141,6 +137,76 @@ export const TOOLS: ToolDef[] = [
       ]
       const ps = numOpt(input, 'page_size')
       if (ps !== undefined) argv.push('--page-size', String(Math.min(100, Math.max(1, ps))))
+      const r = await runCli(argv)
+      return r.ok ? r.data : { error: r.stderr || r.raw, exit: r.exitCode }
+    },
+  },
+  {
+    name: 'lark_search_docs',
+    description:
+      'Search Feishu documents, wiki nodes and spreadsheets by keyword. Returns a compact list of matches (title, type, url, token, snippet). Use this first when the user asks "where is X documented" or wants to find a config table by name/id. Note: only documents shared with this bot are searchable.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Keyword: a topic, an item name, or a config id (max 30 chars)',
+        },
+        doc_types: {
+          type: 'string',
+          description:
+            'Optional comma-separated filter: doc,docx,sheet,bitable,wiki,slides,mindnote,file',
+        },
+      },
+      required: ['query'],
+    },
+    run: async (input) => {
+      const argv = [
+        'drive',
+        '+search',
+        '--as',
+        'bot',
+        '--query',
+        str(input, 'query'),
+        '--jq',
+        '.data.results | map({title: .title_highlighted, type: .result_meta.doc_types, url: .result_meta.url, token: .result_meta.token, snippet: .summary_highlighted})',
+      ]
+      const types = strOpt(input, 'doc_types')
+      if (types) argv.push('--doc-types', types)
+      const r = await runCli(argv)
+      return r.ok ? r.data : { error: r.stderr || r.raw, exit: r.exitCode }
+    },
+  },
+  {
+    name: 'lark_read_sheet',
+    description:
+      'Read cell values from a Feishu spreadsheet. Provide the spreadsheet URL (or token), the sheet (tab) name and an A1 range. Returns a compact 2-D array of values — ideal for reading config/drop-rate tables found via lark_search_docs.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        spreadsheet: { type: 'string', description: 'Spreadsheet URL or token' },
+        sheet_name: { type: 'string', description: 'Sheet (tab) name, e.g. 经济数值QA文档2' },
+        range: { type: 'string', description: 'A1 range without sheet prefix, e.g. A1:G30' },
+      },
+      required: ['spreadsheet', 'sheet_name', 'range'],
+    },
+    run: async (input) => {
+      const target = str(input, 'spreadsheet')
+      const argv = [
+        'sheets',
+        '+cells-get',
+        '--as',
+        'bot',
+        ...(target.startsWith('http') ? ['--url', target] : ['--spreadsheet-token', target]),
+        '--sheet-name',
+        str(input, 'sheet_name'),
+        '--range',
+        str(input, 'range'),
+        '--include',
+        'value',
+        '--jq',
+        '.data.ranges[0].cells | map(map(.value // ""))',
+      ]
       const r = await runCli(argv)
       return r.ok ? r.data : { error: r.stderr || r.raw, exit: r.exitCode }
     },
