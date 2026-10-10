@@ -1,5 +1,6 @@
 import { runCli } from './lark/cli.js'
 import { logger } from './logger.js'
+import { findWikiNode, searchWiki } from './wiki.js'
 
 /**
  * Tool definitions exposed to the LLM. Each tool is a small, audited wrapper
@@ -233,6 +234,110 @@ export const TOOLS: ToolDef[] = [
       else if (userId) argv.push('--user-id', userId)
       const r = await runCli(argv)
       return r.ok ? r.data : { error: r.stderr || r.raw, exit: r.exitCode }
+    },
+  },
+  {
+    name: 'lark_wiki_search',
+    description:
+      '在公司知识库（飞书 Wiki）里按标题关键词检索文档/表格。这是回答"X 的文档在哪""某功能的配置表叫什么"这类问题的首选工具。飞书自带的搜索接口在机器人身份下搜不到未共享给它的文档，本工具改为检索桥自己维护的知识库索引，因此能覆盖 QA 知识库等内部空间。返回标题、所在路径、类型、node_token、obj_token 与链接；命中后用 lark_wiki_read 读正文、用 lark_read_sheet 读表格。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: '关键词，可多个（空格分隔），例如 "GVG 活动" / "掉落概率"',
+        },
+        limit: { type: 'number', description: '最多返回多少条，默认 20' },
+      },
+      required: ['query'],
+    },
+    run: async (input) => {
+      const limit = numOpt(input, 'limit') ?? 20
+      const result = searchWiki(str(input, 'query'), limit)
+      if (result.status === 'disabled') {
+        return { error: '知识库索引未启用（WIKI_ROOT_TOKENS 为空），请改用 lark_search_docs' }
+      }
+      if (result.status === 'building' || result.status === 'empty') {
+        return {
+          status: 'building',
+          note: '知识库索引正在后台构建（首次启动或刚重建，通常 1~3 分钟），稍后再问一次即可。',
+        }
+      }
+      return result
+    },
+  },
+  {
+    name: 'lark_wiki_read',
+    description:
+      '读取一篇知识库文档的正文。参数用 lark_wiki_search 返回的 node_token 或 obj_token。docx 返回正文文本；表格返回第一张工作表的 A1:Z60 区域和全部工作表名（需要看别的区域或工作表时改用 lark_read_sheet）。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        token: { type: 'string', description: 'lark_wiki_search 结果里的 node_token 或 obj_token' },
+      },
+      required: ['token'],
+    },
+    run: async (input) => {
+      const token = str(input, 'token')
+      const node = findWikiNode(token)
+      const objToken = node?.objToken ?? token
+      const objType = node?.objType ?? 'unknown'
+      const meta = {
+        title: node?.title ?? null,
+        path: node?.path ?? null,
+        type: objType,
+      }
+
+      if (objType === 'sheet') {
+        const info = await runCli(['sheets', '+workbook-info', '--as', 'bot', '--spreadsheet-token', objToken])
+        const sheets =
+          (info.data as { data?: { sheets?: Array<{ sheet_name?: string }> } } | null)?.data?.sheets ?? []
+        const names = sheets.map((s) => s.sheet_name).filter((v): v is string => Boolean(v))
+        if (names.length === 0) return { ...meta, error: '读取工作表信息失败', raw: info.stderr || info.raw }
+
+        const cells = await runCli([
+          'sheets',
+          '+cells-get',
+          '--as',
+          'bot',
+          '--spreadsheet-token',
+          objToken,
+          '--sheet-name',
+          names[0],
+          '--range',
+          'A1:Z60',
+          '--include',
+          'value',
+          '--jq',
+          '.data.ranges[0].cells | map(map(.value // ""))',
+        ])
+        return {
+          ...meta,
+          sheet_names: names,
+          preview_sheet: names[0],
+          values: cells.ok ? cells.data : { error: cells.stderr || cells.raw },
+        }
+      }
+
+      if (objType === 'docx' || objType === 'doc') {
+        const r = await runCli(['docs', '+fetch', '--as', 'bot', '--doc', objToken], 60_000)
+        const content = (r.data as { data?: { document?: { content?: string } } } | null)?.data?.document
+          ?.content
+        if (typeof content !== 'string') {
+          return { ...meta, error: '读取文档失败', raw: r.stderr || r.raw }
+        }
+        return {
+          ...meta,
+          chars: content.length,
+          truncated: content.length > 8000,
+          content: content.slice(0, 8000),
+        }
+      }
+
+      return {
+        ...meta,
+        note: '该类型暂不支持直接读正文；可以把链接发给用户，或对 wiki 里的表格改调 lark_wiki_read 之外的方式。',
+      }
     },
   },
 ]
