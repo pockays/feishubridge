@@ -17,7 +17,7 @@
 
 | 项 | 说明 |
 | --- | --- |
-| App ID / App Secret | 就是本机在用的那个应用（`cli_aa427e7ad138dcdd`）。Secret 在开发者后台「凭证与基础信息」里复制 |
+| App ID / App Secret | 你自己的飞书自建应用凭证。Secret 在开发者后台「凭证与基础信息」里复制（只会显示一次） |
 | `.env` | 至少包含 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` |
 | 服务器 | Ubuntu（本机验证过 24.04）、能访问 `open.feishu.cn` 与你的模型 API |
 
@@ -36,7 +36,7 @@ mkdir -p /opt/lark-agent-bridge && tar -xzf /tmp/bridge.tgz -C /opt/lark-agent-b
 
 # 2. 配置 lark-cli（只需一次；secret 走 stdin，不会落到 shell 历史/进程列表）
 printf '%s' '<APP_SECRET>' > /tmp/secret.txt
-lark-cli config init --app-id cli_aa427e7ad138dcdd --app-secret-stdin < /tmp/secret.txt
+lark-cli config init --app-id <APP_ID> --app-secret-stdin < /tmp/secret.txt
 rm -f /tmp/secret.txt
 lark-cli doctor          # 应该全绿
 
