@@ -11,9 +11,13 @@ import { logger } from './logger.js'
  * scoped write path (`lark_send_text`) that requires an already-known
  * `chat_id` — the LLM cannot enumerate chats to discover targets.
  *
- * Identity note: every tool runs `--as bot`. The server deployment only has
- * app credentials (app_id / app_secret) and no user OAuth session, so tools
- * pinned to `--as user` would fail there. Keep new tools on bot identity.
+ * Identity note: read tools run `--as user` so they see exactly what the
+ * operator sees in Feishu (this is what makes search behave like Feishu's own
+ * search bar — the app identity only ever sees resources shared with the app).
+ * The bridge injects a user_access_token per call; when no token is configured
+ * `runCli` transparently downgrades the call to `--as bot`. Write paths
+ * (`lark_send_text`) always stay on the bot identity — the reply must come
+ * from the bot, not from the operator's account.
  */
 
 export interface ToolDef {
@@ -63,7 +67,7 @@ export const TOOLS: ToolDef[] = [
       required: ['query'],
     },
     run: async (input) => {
-      const argv = ['im', '+messages-search', '--as', 'bot', '--query', str(input, 'query')]
+      const argv = ['im', '+messages-search', '--as', 'user', '--query', str(input, 'query')]
       const limit = numOpt(input, 'limit')
       if (limit !== undefined) argv.push('--page-size', String(Math.min(50, Math.max(1, limit))))
       const r = await runCli(argv)
@@ -86,7 +90,7 @@ export const TOOLS: ToolDef[] = [
       const chatId = strOpt(input, 'chat_id')
       const userId = strOpt(input, 'user_id')
       if (!chatId && !userId) throw new Error('chat_id or user_id is required')
-      const argv = ['im', '+chat-messages-list', '--as', 'bot']
+      const argv = ['im', '+chat-messages-list', '--as', 'user']
       if (chatId) argv.push('--chat-id', chatId)
       else if (userId) argv.push('--user-id', userId)
       const limit = numOpt(input, 'limit')
@@ -107,7 +111,7 @@ export const TOOLS: ToolDef[] = [
       required: ['document'],
     },
     run: async (input) => {
-      const r = await runCli(['docs', '+fetch', '--as', 'bot', '--doc', str(input, 'document')])
+      const r = await runCli(['docs', '+fetch', '--as', 'user', '--doc', str(input, 'document')])
       return r.ok ? r.data : { error: r.stderr || r.raw, exit: r.exitCode }
     },
   },
@@ -129,7 +133,7 @@ export const TOOLS: ToolDef[] = [
         'base',
         '+record-search',
         '--as',
-        'bot',
+        'user',
         '--app-token',
         str(input, 'app_token'),
         '--table-id',
@@ -165,7 +169,7 @@ export const TOOLS: ToolDef[] = [
         'drive',
         '+search',
         '--as',
-        'bot',
+        'user',
         '--query',
         str(input, 'query'),
         '--jq',
@@ -196,7 +200,7 @@ export const TOOLS: ToolDef[] = [
         'sheets',
         '+cells-get',
         '--as',
-        'bot',
+        'user',
         ...(target.startsWith('http') ? ['--url', target] : ['--spreadsheet-token', target]),
         '--sheet-name',
         str(input, 'sheet_name'),

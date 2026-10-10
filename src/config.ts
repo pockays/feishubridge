@@ -163,6 +163,25 @@ const Env = z.object({
    */
   METRICS_PORT: z.coerce.number().int().nonnegative().default(9090),
 
+  /**
+   * 用户身份令牌（user_access_token）文件。由 scripts/user-token-login.mjs
+   * 一次性生成，桥负责用里面的 refresh_token 自动续期。
+   *
+   * 存在时，所有读取类工具会以**用户身份**调用 lark-cli —— 这才是"飞书搜索栏"
+   * 的可见范围；不存在则降级回机器人身份（只能看到共享给应用的资源）。
+   */
+  USER_TOKEN_PATH: z.string().min(1).default('data/user-token.json'),
+
+  /** lark-cli 的配置文件位置，用来借它的 appId/appSecret 做令牌续期。 */
+  LARK_CLI_CONFIG_PATH: z.string().min(1).default('/root/.lark-cli/config.json'),
+
+  /** 飞书开放平台域名（续期请求用）。 */
+  LARK_OPEN_API: z.string().url().default('https://open.feishu.cn'),
+
+  /** 可选：直接给应用凭据，省掉读 lark-cli 配置这一步。 */
+  LARK_APP_ID: z.string().default(''),
+  LARK_APP_SECRET: z.string().default(''),
+
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 })
 

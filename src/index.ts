@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 import { run } from './worker.js'
 import { logger } from './logger.js'
+import { startUserTokenKeepAlive } from './user-token.js'
 
 const { stop } = run()
+// 用户令牌保活：refresh_token 只有 7 天，靠定期续期滚动保鲜。
+startUserTokenKeepAlive()
 
 // Hold the event loop open until we explicitly call process.exit(). Without
 // this, an `async` signal handler can race the default SIGTERM behavior:

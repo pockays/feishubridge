@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { logger } from '../logger.js'
+import { appCredentials, getUserAccessToken } from '../user-token.js'
 
 export interface CliResult {
   ok: boolean
@@ -16,15 +17,44 @@ export interface CliResult {
  * - Always passes `--format json` unless `--format` / `--text` / etc. is already present.
  * - Captures stderr separately so tool-call results can include diagnostic info.
  * - Times out at `timeoutMs` (default 30s); a killed command resolves with ok=false.
+ * - For `--as user` calls it injects a fresh user_access_token via
+ *   LARKSUITE_CLI_USER_ACCESS_TOKEN (the container has no keychain, so lark-cli
+ *   cannot keep its own user session there). The CLI refuses a token that
+ *   arrives alone — "blocked by env: ... is set but LARKSUITE_CLI_APP_ID is
+ *   missing" — so the app id/secret ride along in the same env. If no user
+ *   token is configured we downgrade the call to the bot identity so the bridge
+ *   keeps working, just with a narrower visible scope.
  */
-export function runCli(argv: string[], timeoutMs = 30_000): Promise<CliResult> {
+export async function runCli(argv: string[], timeoutMs = 30_000): Promise<CliResult> {
   const wantsFormat = argv.some(
     (a) => a === '--format' || a === '--json' || a === '--text' || a === '--ndjson',
   )
-  const finalArgv = wantsFormat ? argv : [...argv, '--format', 'json']
+  let finalArgv = wantsFormat ? argv : [...argv, '--format', 'json']
+  let env = process.env
+
+  const asIdx = finalArgv.indexOf('--as')
+  const wantsUser = asIdx >= 0 && finalArgv[asIdx + 1] === 'user'
+  if (wantsUser) {
+    const [token, creds] = await Promise.all([getUserAccessToken(), appCredentials()])
+    if (token && creds) {
+      env = {
+        ...process.env,
+        LARKSUITE_CLI_APP_ID: creds.appId,
+        LARKSUITE_CLI_APP_SECRET: creds.appSecret,
+        LARKSUITE_CLI_USER_ACCESS_TOKEN: token,
+      }
+    } else {
+      logger.warn(
+        { argv: finalArgv, hasToken: Boolean(token), hasCreds: Boolean(creds) },
+        'user credentials unavailable, falling back to bot identity',
+      )
+      finalArgv = [...finalArgv]
+      finalArgv[asIdx + 1] = 'bot'
+    }
+  }
 
   return new Promise((resolve) => {
-    const child = spawn('lark-cli', finalArgv, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn('lark-cli', finalArgv, { stdio: ['ignore', 'pipe', 'pipe'], env })
 
     let stdout = ''
     let stderr = ''
