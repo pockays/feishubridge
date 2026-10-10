@@ -46,6 +46,51 @@ function strOpt(input: Record<string, unknown>, key: string): string | undefined
   return v
 }
 
+interface SheetTab {
+  name: string
+  id: string
+  rows: number
+  cols: number
+  hidden: boolean
+}
+
+/** 列出工作簿的所有页签（名称 / id / 行列数 / 是否隐藏）。 */
+async function sheetDimensions(spreadsheet: string): Promise<SheetTab[]> {
+  const r = await runCli([
+    'sheets',
+    '+workbook-info',
+    '--as',
+    'user',
+    ...(spreadsheet.startsWith('http')
+      ? ['--url', spreadsheet]
+      : ['--spreadsheet-token', spreadsheet]),
+    '--jq',
+    '.data.sheets | map({name: .sheet_name, id: .sheet_id, rows: .row_count, cols: .column_count, hidden: .is_hidden})',
+  ])
+  if (!r.ok || !Array.isArray(r.data)) return []
+  return (r.data as Array<Partial<SheetTab>>)
+    .filter((s) => typeof s.name === 'string' && s.name)
+    .map((s) => ({
+      name: s.name ?? '',
+      id: s.id ?? '',
+      rows: s.rows ?? 0,
+      cols: s.cols ?? 0,
+      hidden: s.hidden === true,
+    }))
+}
+
+/** 1 → A, 27 → AA（读整页时用来算末列）。 */
+function columnLetter(n: number): string {
+  let out = ''
+  let x = Math.max(1, Math.floor(n))
+  while (x > 0) {
+    const rem = (x - 1) % 26
+    out = String.fromCharCode(65 + rem) + out
+    x = Math.floor((x - 1) / 26)
+  }
+  return out
+}
+
 function numOpt(input: Record<string, unknown>, key: string): number | undefined {
   const v = input[key]
   if (v === undefined) return undefined
@@ -233,35 +278,158 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'lark_read_sheet',
     description:
-      'Read cell values from a Feishu spreadsheet. Provide the spreadsheet URL (or token), the sheet (tab) name and an A1 range. Returns a compact 2-D array of values — ideal for reading config/drop-rate tables found via lark_search_docs.',
+      'Read cell values from one tab of a Feishu spreadsheet. Give the spreadsheet URL (or token) plus the tab (sheet_name, or sheet_id from lark_sheet_info) and an A1 range; omit the range to read the tab\'s whole used area (capped at 200 rows). IMPORTANT: config/ID workbooks often have dozens of tabs and thousands of rows — call lark_sheet_info first for the tab list, and prefer lark_search_in_sheet when hunting for one specific row/ID instead of reading everything.',
     input_schema: {
       type: 'object',
       properties: {
         spreadsheet: { type: 'string', description: 'Spreadsheet URL or token' },
-        sheet_name: { type: 'string', description: 'Sheet (tab) name, e.g. 经济数值QA文档2' },
-        range: { type: 'string', description: 'A1 range without sheet prefix, e.g. A1:G30' },
+        sheet_name: { type: 'string', description: 'Sheet (tab) name, e.g. 活动' },
+        sheet_id: {
+          type: 'string',
+          description: 'Sheet id from lark_sheet_info — use instead of sheet_name when that is easier',
+        },
+        range: {
+          type: 'string',
+          description: 'A1 range without sheet prefix, e.g. A1:G30 or B10:U20. Omit to read the whole used area.',
+        },
+        max_rows: { type: 'number', description: 'Row cap used when range is omitted (default 200)' },
       },
-      required: ['spreadsheet', 'sheet_name', 'range'],
+      required: ['spreadsheet'],
     },
     run: async (input) => {
       const target = str(input, 'spreadsheet')
+      const sheetName = strOpt(input, 'sheet_name')
+      const sheetId = strOpt(input, 'sheet_id')
+      let range = strOpt(input, 'range')
+
+      if (!sheetName && !sheetId) {
+        const tabs = await sheetDimensions(target)
+        return {
+          error: '需要 sheet_name 或 sheet_id：先看下面的 tabs，或改用 lark_search_in_sheet 定位具体单元格',
+          tabs: tabs.map((s) => ({ name: s.name, id: s.id, rows: s.rows, cols: s.cols })),
+        }
+      }
+
+      if (!range) {
+        const tabs = await sheetDimensions(target)
+        const tab = tabs.find((s) => s.name === sheetName || s.id === sheetId)
+        const rows = Math.max(1, Math.min(numOpt(input, 'max_rows') ?? 200, tab?.rows ?? 200))
+        const cols = Math.max(1, Math.min(30, tab?.cols ?? 20))
+        range = `A1:${columnLetter(cols)}${rows}`
+      }
+
       const argv = [
         'sheets',
         '+cells-get',
         '--as',
         'user',
         ...(target.startsWith('http') ? ['--url', target] : ['--spreadsheet-token', target]),
-        '--sheet-name',
-        str(input, 'sheet_name'),
+        ...(sheetId ? ['--sheet-id', sheetId] : ['--sheet-name', sheetName ?? '']),
         '--range',
-        str(input, 'range'),
+        range,
         '--include',
         'value',
         '--jq',
         '.data.ranges[0].cells | map(map(.value // ""))',
       ]
       const r = await runCli(argv)
-      return r.ok ? r.data : { error: r.stderr || r.raw, exit: r.exitCode }
+      return r.ok ? { range, values: r.data } : { error: r.stderr || r.raw, exit: r.exitCode }
+    },
+  },
+  {
+    name: 'lark_sheet_info',
+    description:
+      'List every tab of a Feishu spreadsheet (name, sheet_id, row/column count, hidden flag). ALWAYS call this before reading a workbook you do not know: ID/config workbooks routinely have 30+ tabs (道具/装备/活动/副本…), and guessing one tab is exactly how an answer ends up incomplete.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        spreadsheet: { type: 'string', description: 'Spreadsheet URL or token' },
+      },
+      required: ['spreadsheet'],
+    },
+    run: async (input) => {
+      const tabs = await sheetDimensions(str(input, 'spreadsheet'))
+      if (tabs.length === 0) return { error: '读不到工作表信息（token 不对，或没有权限）' }
+      return {
+        tab_count: tabs.length,
+        tabs: tabs.map((s) => ({
+          name: s.name,
+          id: s.id,
+          rows: s.rows,
+          cols: s.cols,
+          ...(s.hidden ? { hidden: true } : {}),
+        })),
+      }
+    },
+  },
+  {
+    name: 'lark_search_in_sheet',
+    description:
+      'Find a value inside a Feishu spreadsheet and return its cell address (e.g. B15 in tab 活动). This is the tool for "这个 ID / 活动 / 道具在哪张表" — the document search only indexes titles, so a row like 公会KVM[公][限] is invisible to it. Pass sheet_name to scan one tab, or omit it to scan every visible tab of the workbook.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        spreadsheet: { type: 'string', description: 'Spreadsheet URL or token' },
+        find: { type: 'string', description: 'Text to look for (whole or partial cell content)' },
+        sheet_name: { type: 'string', description: 'Optional: restrict the scan to one tab' },
+        match_case: { type: 'boolean', description: 'Case-sensitive match (default false)' },
+      },
+      required: ['spreadsheet', 'find'],
+    },
+    run: async (input) => {
+      const target = str(input, 'spreadsheet')
+      const find = str(input, 'find')
+      const wantSheet = strOpt(input, 'sheet_name')
+      const matchCase = input.match_case === true
+      const targetArg = target.startsWith('http')
+        ? ['--url', target]
+        : ['--spreadsheet-token', target]
+
+      const searchTab = async (sheetName: string) => {
+        const r = await runCli([
+          'sheets',
+          '+cells-search',
+          '--as',
+          'user',
+          ...targetArg,
+          '--sheet-name',
+          sheetName,
+          '--find',
+          find,
+          ...(matchCase ? ['--match-case'] : []),
+          '--jq',
+          '.data.matches | map({address: .address, value: .value})',
+        ])
+        if (!r.ok || !Array.isArray(r.data)) return []
+        return (r.data as Array<{ address: string; value: string }>).map((m) => ({
+          sheet: sheetName,
+          address: m.address,
+          value: m.value,
+        }))
+      }
+
+      if (wantSheet) {
+        const matches = await searchTab(wantSheet)
+        return { find, scanned_tabs: [wantSheet], match_count: matches.length, matches }
+      }
+
+      const tabs = (await sheetDimensions(target)).filter((s) => !s.hidden).slice(0, 40)
+      if (tabs.length === 0) return { error: '读不到工作表列表' }
+
+      const matches: Array<{ sheet: string; address: string; value: string }> = []
+      const CHUNK = 4
+      for (let i = 0; i < tabs.length && matches.length < 50; i += CHUNK) {
+        const batch = tabs.slice(i, i + CHUNK)
+        const results = await Promise.all(batch.map((t) => searchTab(t.name)))
+        for (const group of results) matches.push(...group)
+      }
+
+      return {
+        find,
+        scanned_tab_count: tabs.length,
+        match_count: matches.length,
+        matches: matches.slice(0, 50),
+      }
     },
   },
   {
