@@ -148,13 +148,18 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'lark_search_docs',
     description:
-      'Search Feishu documents, wiki nodes and spreadsheets by keyword. Returns a compact list of matches (title, type, url, token, snippet). Use this first when the user asks "where is X documented" or wants to find a config table by name/id. Note: only documents shared with this bot are searchable.',
+      'Search Feishu documents, wiki nodes and spreadsheets by keyword (runs with the operator\'s own permission scope, so results match what they can see in Feishu). Returns {total, returned, has_more, results[]}: `total` is the FULL number of matches — always quote it when the user asks "how many"; `results` is only the page you asked for (≤20 per page, and the tool pages through automatically when limit > 20, up to 5 pages). Each item has title, type, url, token, snippet. Use this first when the user asks "where is X documented" or wants to find a config table by name/id.',
     input_schema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
           description: 'Keyword: a topic, an item name, or a config id (max 30 chars)',
+        },
+        limit: {
+          type: 'number',
+          description:
+            'How many results to return, up to 100 (default 15). `total` is unaffected by this — it is always the full match count.',
         },
         doc_types: {
           type: 'string',
@@ -165,20 +170,64 @@ export const TOOLS: ToolDef[] = [
       required: ['query'],
     },
     run: async (input) => {
-      const argv = [
-        'drive',
-        '+search',
-        '--as',
-        'user',
-        '--query',
-        str(input, 'query'),
-        '--jq',
-        '.data.results | map({title: .title_highlighted, type: .result_meta.doc_types, url: .result_meta.url, token: .result_meta.token, snippet: .summary_highlighted})',
-      ]
+      const limit = Math.max(1, Math.min(100, numOpt(input, 'limit') ?? 15))
+      const pageSize = Math.min(20, limit)
+      const maxPages = Math.max(1, Math.min(5, Math.ceil(limit / pageSize)))
       const types = strOpt(input, 'doc_types')
-      if (types) argv.push('--doc-types', types)
-      const r = await runCli(argv)
-      return r.ok ? r.data : { error: r.stderr || r.raw, exit: r.exitCode }
+
+      // 接口一页最多 20 条且默认只给 15 条；这里自己翻页，并把 total 一并带回去
+      // —— 少了 total，模型会把"第一页有 15 条"当成"一共 15 条"。
+      const collected: unknown[] = []
+      let total: number | null = null
+      let hasMore = false
+      let nextToken: string | undefined
+
+      for (let page = 0; page < maxPages; page++) {
+        const argv = [
+          'drive',
+          '+search',
+          '--as',
+          'user',
+          '--query',
+          str(input, 'query'),
+          '--page-size',
+          String(pageSize),
+          '--jq',
+          '.data | {total: .total, has_more: .has_more, page_token: .page_token, results: (.results | map({title: (.title_highlighted | gsub("<h>"; "") | gsub("</h>"; "")), type: .result_meta.doc_types, url: .result_meta.url, token: .result_meta.token, snippet: .summary_highlighted}))}',
+        ]
+        if (types) argv.push('--doc-types', types)
+        if (nextToken) argv.push('--page-token', nextToken)
+
+        const r = await runCli(argv)
+        if (!r.ok) {
+          return {
+            error: r.stderr || r.raw,
+            exit: r.exitCode,
+            returned: collected.length,
+            ...(total !== null ? { total } : {}),
+          }
+        }
+
+        const page_ = r.data as {
+          total?: number
+          has_more?: boolean
+          page_token?: string
+          results?: unknown[]
+        } | null
+        if (typeof page_?.total === 'number') total = page_.total
+        collected.push(...(page_?.results ?? []))
+        hasMore = Boolean(page_?.has_more)
+        nextToken = page_?.page_token
+        if (!hasMore || !nextToken || collected.length >= limit) break
+      }
+
+      return {
+        total,
+        returned: collected.length,
+        has_more: hasMore,
+        next_page_token: hasMore ? (nextToken ?? null) : null,
+        results: collected.slice(0, limit),
+      }
     },
   },
   {
