@@ -40,7 +40,7 @@ export interface ChatResult {
   toolCalls: number
 }
 
-const SYSTEM_PROMPT = `You are a helpful Feishu/Lark assistant connected to the user via a bot bridge. Reply in the same language as the user's message. When the user asks about specific chats, documents, or tables they have access to, use the provided tools to fetch real data rather than guessing. To find a document (someone asks "X 的文档在哪""某配置表叫什么"), try lark_wiki_search first — it searches the company wiki index — then read the hit with lark_wiki_read. Keep replies concise — this is a chat UI.`
+const SYSTEM_PROMPT = `You are a helpful Feishu/Lark assistant connected to the user via a bot bridge. Reply in the same language as the user's message. When the user asks about specific chats, documents, or tables they have access to, use the provided tools to fetch real data rather than guessing. Keep replies concise — this is a chat UI.`
 
 export async function chat(history: ChatMessage[]): Promise<ChatResult> {
   // Anthropic SDK uses MessageParam[] which accepts string content for the

@@ -1,11 +1,8 @@
 #!/usr/bin/env node
 import { run } from './worker.js'
 import { logger } from './logger.js'
-import { startWikiIndex } from './wiki.js'
 
 const { stop } = run()
-// 知识库索引：先从磁盘加载，过期/缺失时后台重建（不阻塞消息消费）。
-startWikiIndex()
 
 // Hold the event loop open until we explicitly call process.exit(). Without
 // this, an `async` signal handler can race the default SIGTERM behavior:

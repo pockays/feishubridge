@@ -163,32 +163,6 @@ const Env = z.object({
    */
   METRICS_PORT: z.coerce.number().int().nonnegative().default(9090),
 
-  /**
-   * 知识库（Wiki）索引的根节点，逗号分隔的 "spaceId:nodeToken"。
-   *
-   * 飞书「搜索云文档」接口在应用身份下只能搜到共享给该应用的文档，所以 bot
-   * 直接搜是搜不到企业知识库的。这里配置若干根节点后，桥会定期爬这些子树并
-   * 在本地建索引，`lark_wiki_search` 才能检索到。
-   *
-   * 留空 = 关闭该功能。
-   */
-  WIKI_ROOT_TOKENS: z.string().default(''),
-
-  /** 索引落盘位置。放在持久卷里，重启后无需重新爬。 */
-  WIKI_INDEX_PATH: z.string().min(1).default('data/wiki-index.json'),
-
-  /** 单次爬取的节点上限（防止超大知识库把内存/时间打满）。 */
-  WIKI_INDEX_MAX_NODES: z.coerce.number().int().positive().default(2000),
-
-  /** 并发爬取的请求数。每个请求都是一次 lark-cli 调用，别调太高。 */
-  WIKI_INDEX_CONCURRENCY: z.coerce.number().int().positive().max(16).default(6),
-
-  /** 索引多长时间重建一次（小时）。 */
-  WIKI_INDEX_REFRESH_HOURS: z.coerce.number().positive().default(12),
-
-  /** 拼文档链接用的域名前缀，例如 https://thedream.feishu.cn */
-  WIKI_DOC_HOST: z.string().min(1).default('https://thedream.feishu.cn'),
-
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 })
 
