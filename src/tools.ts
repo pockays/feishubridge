@@ -26,7 +26,10 @@ export interface ToolDef {
   /** JSON Schema for input_schema, per Anthropic tool-use spec. */
   input_schema: {
     type: 'object'
-    properties: Record<string, { type: string; description: string }>
+    properties: Record<
+      string,
+      { type: string; description: string; items?: { type: string }; enum?: string[] }
+    >
     required?: string[]
   }
   /** Map input args to lark-cli argv. */
@@ -44,6 +47,53 @@ function strOpt(input: Record<string, unknown>, key: string): string | undefined
   if (v === undefined) return undefined
   if (typeof v !== 'string') throw new Error(`tool input '${key}' must be a string`)
   return v
+}
+
+function strArray(input: Record<string, unknown>, key: string): string[] {
+  const v = input[key]
+  if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
+    throw new Error(`tool input '${key}' must be an array of strings`)
+  }
+  return v as string[]
+}
+
+/**
+ * 通用入口的边界。
+ *
+ * 为什么不是"每条命令一个工具"：有权限的域里光 shortcut 就有 300 条左右，逐条
+ * 定义会让每次请求多背 ~1.8 万 token 的工具说明，既贵又会让模型选错工具。
+ *
+ * 这里的策略：
+ *   1. 域白名单 —— 只放我们确实拿到 scope 的域（base/docs/drive/im/
+ *      markdown/sheets/whiteboard/wiki）。日历、任务、邮箱等没授权，直接拒绝。
+ *   2. 风险门禁 —— 读命令（Risk: read）和普通写命令放行；`high-risk-write`
+ *      （删页签/清空单元格/删文件/撤回消息这类不可逆操作）一律拒绝，需要人工
+ *      确认后再单独处理。`--yes` 永远透传不出去。
+ *   3. 身份由 identity 参数决定，argv 里的 --as 会被剥掉，避免模型自己乱切。
+ */
+const ALLOWED_CLI_DOMAINS = new Set([
+  'base',
+  'docs',
+  'drive',
+  'im',
+  'markdown',
+  'sheets',
+  'whiteboard',
+  'wiki',
+])
+
+type RiskLevel = 'read' | 'write' | 'high-risk-write' | 'unknown'
+const riskCache = new Map<string, RiskLevel>()
+
+async function commandRisk(domain: string, sub: string): Promise<RiskLevel> {
+  const key = `${domain} ${sub}`
+  const cached = riskCache.get(key)
+  if (cached) return cached
+  const r = await runCli([domain, sub, '--help'], 20_000)
+  const m = /Risk:\s*(read|write|high-risk-write)/.exec(`${r.raw}\n${r.stderr}`)
+  const risk: RiskLevel = m ? (m[1] as RiskLevel) : 'unknown'
+  riskCache.set(key, risk)
+  return risk
 }
 
 interface SheetTab {
@@ -454,6 +504,82 @@ export const TOOLS: ToolDef[] = [
       else if (userId) argv.push('--user-id', userId)
       const r = await runCli(argv)
       return r.ok ? r.data : { error: r.stderr || r.raw, exit: r.exitCode }
+    },
+  },
+  {
+    name: 'lark_cli',
+    description:
+      'Run ANY authorised Feishu CLI command — use this whenever the task needs a capability the purpose-built tools above do not cover (multi-dimensional tables/Bitable records, uploading files to Drive, writing cells, creating docs, chat administration, whiteboards, …). Pass argv as an array of strings WITHOUT the leading "lark-cli", e.g. ["base","+record-search","--base-token","<t>","--table-id","<id>","--keyword","Alice"] or ["drive","+upload","--file","/tmp/a.png","--folder-token","<t>"]. Discover what exists with ["<domain>","--help"] and inspect flags with ["<domain>","<command>","--help"]. Do NOT pass --as (choose `identity` instead) and do NOT pass --yes. Commands that are irreversible (delete/clear/recall/remove) are rejected by the bridge and must be done by a human.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        argv: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Full command after "lark-cli", e.g. ["wiki","+node-list","--space-id","123","--parent-node-token","abc"]',
+        },
+        identity: {
+          type: 'string',
+          enum: ['user', 'bot'],
+          description:
+            'Which identity to call with: user (the operator\'s own permissions, default) or bot (the app itself, needed for things like sending messages).',
+        },
+      },
+      required: ['argv'],
+    },
+    run: async (input) => {
+      const raw = strArray(input, 'argv')
+      const identity = strOpt(input, 'identity') === 'bot' ? 'bot' : 'user'
+
+      // 剥掉 --as（身份由 identity 参数决定）和 --yes（高危操作不能自助确认）
+      const cleaned: string[] = []
+      for (let i = 0; i < raw.length; i++) {
+        if (raw[i] === '--as') {
+          i += 1
+          continue
+        }
+        if (raw[i] === '--yes') continue
+        cleaned.push(raw[i])
+      }
+
+      const domain = cleaned[0]
+      const sub = cleaned[1]
+      if (!domain || domain.startsWith('-')) {
+        return { error: 'argv 至少要包含域名，例如 ["sheets","--help"]' }
+      }
+      if (!ALLOWED_CLI_DOMAINS.has(domain)) {
+        return {
+          error: `域 "${domain}" 不在允许列表里（该域需要额外授权）`,
+          allowed_domains: [...ALLOWED_CLI_DOMAINS],
+        }
+      }
+
+      // 只有域名或带了 --help → 当作查看帮助，直接放行
+      const wantsHelp = cleaned.includes('--help') || cleaned.includes('-h')
+      if (!sub || sub.startsWith('-') || wantsHelp) {
+        const r = await runCli(cleaned, 30_000)
+        return r.ok ? { result: r.raw.slice(0, 6000) } : { error: r.stderr || r.raw }
+      }
+
+      const risk = await commandRisk(domain, sub)
+      if (risk === 'high-risk-write') {
+        return {
+          error: `"${domain} ${sub}" 是不可逆的高危操作，桥已拒绝执行`,
+          hint: '把这一步交给人来做；如果确实要自动化，告诉我，我单独放开。',
+        }
+      }
+      if (risk === 'unknown') {
+        return {
+          error: `无法确认 "${domain} ${sub}" 的风险等级，已拒绝`,
+          hint: '先看 ["' + domain + '","--help"] 确认命令名是否正确。',
+        }
+      }
+
+      const r = await runCli([...cleaned, '--as', identity], 60_000)
+      return r.ok
+        ? r.data
+        : { error: r.stderr || r.raw, exit: r.exitCode, risk, identity }
     },
   },
 ]
