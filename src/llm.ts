@@ -8,6 +8,7 @@ import type {
 import { config } from './config.js'
 import { logger } from './logger.js'
 import { anthropicTools, executeTool } from './tools.js'
+import { stripToolMarkup } from './sanitize.js'
 
 /**
  * Anthropic client wrapper with tool-use loop. The loop:
@@ -117,7 +118,39 @@ export async function chat(history: ChatMessage[]): Promise<ChatResult> {
     messages.push({ role: 'user', content: toolResults })
   }
 
-  if (!finalText) {
+  // 模型偶尔会退化成输出原生工具调用标记（不是结构化 tool_use），
+  // 那玩意儿发到飞书就是一堆乱码标签。清掉；如果清完什么都不剩，
+  // 再给它一次机会，明确要求用自然语言作答。
+  const sanitized = stripToolMarkup(finalText)
+  if (sanitized.hadMarkup) {
+    logger.warn({ toolCalls, before: finalText.length }, 'model leaked raw tool-call markup, stripped')
+    finalText = sanitized.text
+  }
+
+  if (!finalText && sanitized.hadMarkup && config.ENABLE_TOOLS) {
+    try {
+      const retry = await client.messages.create({
+        model: config.ANTHROPIC_MODEL,
+        max_tokens: config.MAX_TOKENS_REPLY,
+        system: SYSTEM_PROMPT,
+        messages: [
+          ...messages,
+          {
+            role: 'user',
+            content:
+              '你上一条回复只输出了工具调用的标记，没有正文。请直接用自然语言把答案写给用户，不要再输出任何标记。',
+          },
+        ],
+      })
+      totalIn += retry.usage.input_tokens
+      totalOut += retry.usage.output_tokens
+      finalText = stripToolMarkup(extractText(retry.content)).text
+    } catch (err) {
+      logger.error({ err: (err as Error).message }, 'recovery call after leaked markup failed')
+    }
+  }
+
+  if (!finalText || finalText === '(empty response)') {
     finalText =
       '我查了几轮还没能给出结论（工具调用次数用尽）。可以再问一次，或者把范围说具体一点——比如直接给我文档/表格的名字。'
   }
