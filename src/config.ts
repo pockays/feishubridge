@@ -189,6 +189,12 @@ const Env = z.object({
   LARK_APP_ID: z.string().default(''),
   LARK_APP_SECRET: z.string().default(''),
 
+  /**
+   * 拼文档链接用的域名（租户域名）。实测知识库里的表格必须用
+   * `<host>/wiki/<node_token>` 这种形式，`<host>/sheets/<token>` 会 404。
+   */
+  LARK_DOC_HOST: z.string().min(1).default('https://thedream.feishu.cn'),
+
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 })
 

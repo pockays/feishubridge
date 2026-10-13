@@ -1,5 +1,6 @@
 import { runCli } from './lark/cli.js'
 import { logger } from './logger.js'
+import { config } from './config.js'
 
 /**
  * Tool definitions exposed to the LLM. Each tool is a small, audited wrapper
@@ -104,6 +105,37 @@ interface SheetTab {
   hidden: boolean
 }
 
+/**
+ * 把一个文档 token 变成能直接在飞书里打开的链接。
+ *
+ * 实测坑：知识库里的文件必须用 `<host>/wiki/<node_token>`，写成
+ * `<host>/sheets/<token>` 会打开"页面不存在"。而 wiki 节点接口能用同一个
+ * token 反查出 node_token，所以先问它；反查不到（不是知识库里的文件）就退
+ * 回按类型拼路径。
+ */
+async function resolveDocUrl(token: string, kind?: string): Promise<string | null> {
+  const host = config.LARK_DOC_HOST.replace(/\/$/, '')
+  if (/^https?:\/\//i.test(token)) return token
+
+  const r = await runCli(['wiki', '+node-get', '--as', 'user', '--node-token', token, '--jq', '.data.node_token'])
+  const nodeToken = typeof r.data === 'string' ? r.data.trim() : ''
+  if (r.ok && nodeToken) return `${host}/wiki/${nodeToken}`
+
+  switch (kind) {
+    case 'SHEET':
+    case 'sheet':
+      return `${host}/sheets/${token}`
+    case 'BITABLE':
+    case 'bitable':
+      return `${host}/base/${token}`
+    case 'DOCX':
+    case 'docx':
+      return `${host}/docx/${token}`
+    default:
+      return null
+  }
+}
+
 /** 列出工作簿的所有页签（名称 / id / 行列数 / 是否隐藏）。 */
 async function sheetDimensions(spreadsheet: string): Promise<SheetTab[]> {
   const r = await runCli([
@@ -206,8 +238,12 @@ export const TOOLS: ToolDef[] = [
       required: ['document'],
     },
     run: async (input) => {
-      const r = await runCli(['docs', '+fetch', '--as', 'user', '--doc', str(input, 'document')])
-      return r.ok ? r.data : { error: r.stderr || r.raw, exit: r.exitCode }
+      const id = str(input, 'document')
+      const r = await runCli(['docs', '+fetch', '--as', 'user', '--doc', id])
+      const url = await resolveDocUrl(id, 'docx')
+      return r.ok
+        ? { ...(url ? { url } : {}), document: r.data }
+        : { error: r.stderr || r.raw, exit: r.exitCode }
     },
   },
   {
@@ -243,7 +279,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'lark_search_docs',
     description:
-      'Search Feishu documents, wiki nodes and spreadsheets by keyword (runs with the operator\'s own permission scope, so results match what they can see in Feishu). Returns {total, returned, has_more, results[]}: `total` is the FULL number of matches — always quote it when the user asks "how many"; `results` is only the page you asked for (≤20 per page, and the tool pages through automatically when limit > 20, up to 5 pages). Each item has title, type, url, token, snippet. Use this first when the user asks "where is X documented" or wants to find a config table by name/id.',
+      'Search Feishu documents, wiki nodes and spreadsheets by keyword (runs with the operator\'s own permission scope, so results match what they can see in Feishu). Returns {total, returned, has_more, results[]}: `total` is the FULL number of matches — always quote it when the user asks "how many"; `results` is only the page you asked for (≤20 per page, and the tool pages through automatically when limit > 20, up to 5 pages). Each item has title, type, url, token, snippet — the `url` is a working Feishu link, include it in your answer whenever you mention that document. Use this first when the user asks "where is X documented" or wants to find a config table by name/id.',
     input_schema: {
       type: 'object',
       properties: {
@@ -383,7 +419,10 @@ export const TOOLS: ToolDef[] = [
         '.data.ranges[0].cells | map(map(.value // ""))',
       ]
       const r = await runCli(argv)
-      return r.ok ? { range, values: r.data } : { error: r.stderr || r.raw, exit: r.exitCode }
+      const url = await resolveDocUrl(target, 'sheet')
+      return r.ok
+        ? { ...(url ? { url } : {}), range, values: r.data }
+        : { error: r.stderr || r.raw, exit: r.exitCode }
     },
   },
   {
@@ -398,9 +437,12 @@ export const TOOLS: ToolDef[] = [
       required: ['spreadsheet'],
     },
     run: async (input) => {
-      const tabs = await sheetDimensions(str(input, 'spreadsheet'))
+      const target = str(input, 'spreadsheet')
+      const tabs = await sheetDimensions(target)
       if (tabs.length === 0) return { error: '读不到工作表信息（token 不对，或没有权限）' }
+      const url = await resolveDocUrl(target, 'sheet')
       return {
+        ...(url ? { url } : {}),
         tab_count: tabs.length,
         tabs: tabs.map((s) => ({
           name: s.name,
@@ -434,6 +476,9 @@ export const TOOLS: ToolDef[] = [
       const targetArg = target.startsWith('http')
         ? ['--url', target]
         : ['--spreadsheet-token', target]
+      const url = await resolveDocUrl(target, 'sheet')
+      const withUrl = <T extends Record<string, unknown>>(body: T) =>
+        url ? { ...body, url } : body
 
       const searchTab = async (sheetName: string) => {
         const r = await runCli([
@@ -460,7 +505,7 @@ export const TOOLS: ToolDef[] = [
 
       if (wantSheet) {
         const matches = await searchTab(wantSheet)
-        return { find, scanned_tabs: [wantSheet], match_count: matches.length, matches }
+        return withUrl({ find, scanned_tabs: [wantSheet], match_count: matches.length, matches })
       }
 
       const tabs = (await sheetDimensions(target)).filter((s) => !s.hidden).slice(0, 40)
@@ -474,12 +519,12 @@ export const TOOLS: ToolDef[] = [
         for (const group of results) matches.push(...group)
       }
 
-      return {
+      return withUrl({
         find,
         scanned_tab_count: tabs.length,
         match_count: matches.length,
         matches: matches.slice(0, 50),
-      }
+      })
     },
   },
   {
