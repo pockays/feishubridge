@@ -498,6 +498,11 @@ export const TOOLS: ToolDef[] = [
           description:
             'Stop scanning once this many matches are found (default 10, max 50). Scanning every tab of a big workbook costs ~1s per tab, so keep this small unless you truly need exhaustiveness.',
         },
+        scan_all: {
+          type: 'boolean',
+          description:
+            'Set true to scan EVERY visible tab regardless of how many matches appear (up to 100 returned). Use it when the user asks for 所有/全部/完整清单 —— the default early-stop can miss later tabs.',
+        },
       },
       required: ['spreadsheet', 'find'],
     },
@@ -546,24 +551,36 @@ export const TOOLS: ToolDef[] = [
 
       // 整本扫描是 N 次 API 调用（每个页签一次，各约 1 秒），找到足够结果就停，
       // 不必把 30 多个页签全扫完 —— 实测这一条能把 11 秒压到 3~4 秒。
+      // 但"找得到"和"找全"是两回事：用户明确要全部时，用 scan_all 扫完。
+      const scanAll = input.scan_all === true
       const maxMatches = Math.max(1, Math.min(50, numOpt(input, 'max_matches') ?? 10))
+      const stopAt = scanAll ? Number.MAX_SAFE_INTEGER : maxMatches
+      // 返回上限跟"何时停止扫描"是两件事：已经扫出来的命中没理由藏起来
+      // （扫描成本已经付了），所以返回上限放宽，max_matches 只用来决定何时停止扫描。
+      const returnLimit = scanAll ? 100 : 60
       const matches: Array<{ sheet: string; address: string; value: string }> = []
       let scanned = 0
       const CHUNK = 6
-      for (let i = 0; i < tabs.length && matches.length < maxMatches; i += CHUNK) {
+      for (let i = 0; i < tabs.length && matches.length < stopAt; i += CHUNK) {
         const batch = tabs.slice(i, i + CHUNK)
         scanned += batch.length
         const results = await Promise.all(batch.map((t) => searchTab(t.name)))
         for (const group of results) matches.push(...group)
       }
 
+      const stoppedEarly = scanned < tabs.length
       return withUrl({
         find,
         scanned_tab_count: scanned,
         total_tabs: tabs.length,
-        stopped_early: scanned < tabs.length,
+        stopped_early: stoppedEarly,
+        ...(stoppedEarly
+          ? {
+              note: `扫了 ${scanned}/${tabs.length} 个页签就达到 ${maxMatches} 条上限（已命中 ${matches.length} 条，全部返回），后面还有页签没扫 —— 若用户要"全部/所有"，请带 scan_all=true 重扫一次。`,
+            }
+          : {}),
         match_count: matches.length,
-        matches: matches.slice(0, maxMatches),
+        matches: matches.slice(0, returnLimit),
       })
     },
   },
