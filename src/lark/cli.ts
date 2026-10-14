@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { logger } from '../logger.js'
 import { appCredentials, getUserAccessToken } from '../user-token.js'
+import { config } from '../config.js'
 
 export interface CliResult {
   ok: boolean
@@ -64,7 +65,8 @@ export async function runCli(
   let last: CliResult = { ok: false, data: null, raw: '', stderr: '', exitCode: -1 }
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    last = await spawnCli(finalArgv, env, timeoutMs)
+    // 退避等待时不占槽位，否则会把全局闸门堵死
+    last = await withSlot(() => spawnCli(finalArgv, env, timeoutMs))
     if (last.ok) return last
 
     const limit = rateLimitInfo(last)
@@ -91,6 +93,29 @@ const RATE_LIMIT_ATTEMPTS = 3
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * 全局并发闸门：飞书云空间接口频控 5 QPS，而模型一轮可能发多个工具调用、
+ * 每个工具内部又自己并发（整本表扫描最多 6 路），叠起来很容易瞬时超限。
+ * 所有 lark-cli 子进程统一从这里取槽位。
+ */
+let activeSlots = 0
+const slotWaiters: Array<() => void> = []
+
+async function withSlot<T>(fn: () => Promise<T>): Promise<T> {
+  const limit = Math.max(1, config.LARK_CLI_CONCURRENCY)
+  while (activeSlots >= limit) {
+    await new Promise<void>((resolve) => slotWaiters.push(resolve))
+  }
+  activeSlots += 1
+  try {
+    return await fn()
+  } finally {
+    activeSlots -= 1
+    const next = slotWaiters.shift()
+    if (next) next()
+  }
 }
 
 /**

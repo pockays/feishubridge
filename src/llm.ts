@@ -47,7 +47,9 @@ const SYSTEM_PROMPT = `You are a helpful Feishu/Lark assistant connected to the 
 
 Be economical with tools — this is a chat UI and the user is waiting:
 - Search first, then read only the 1-3 most relevant hits. Do NOT read every result.
+- 回答要短：一般控制在 200 字以内。除非用户明确要清单，不要整张表照搬，只给关键几行/几个字段。输出越长用户等得越久。
 - For spreadsheets: call lark_sheet_info to see the tab list before reading (they often have 30+ tabs), and use lark_search_in_sheet to locate a specific row/ID — never assume the first tab or a guessed range holds the answer.
+- 在表里找东西时用 lark_search_in_sheet，并且**尽量带上 sheet_name**：只扫一页约 1 秒，扫整本 38 页要 20 秒。猜得出大概在哪页（道具/活动/装备…）就先只扫那页；实在不知道再整本扫。不要反复换关键词重扫整本表，两次没找到就换策略或直接说明没找到。
 - When a task needs something the tools above do not cover (Bitable records, uploading files, writing cells, chat admin, whiteboards…), use lark_cli with the raw command array; it exposes every authorised Feishu CLI command. Irreversible commands are refused by the bridge — tell the user to do those by hand.
 - ALWAYS 附上来源链接：只要回答里提到了具体的文档、表格或某一行数据，就用 Markdown 链接写出工具结果里返回的 url 字段，例如 [《…常用ID信息表》](https://thedream.feishu.cn/wiki/xxxx)。直接复制工具给的 url，不要自己拼。多个来源就列多条链接。
 - The moment you have enough to answer, stop calling tools and write the answer.
@@ -106,16 +108,19 @@ export async function chat(history: ChatMessage[]): Promise<ChatResult> {
     // Echo the assistant turn verbatim so the next request has full context.
     messages.push({ role: 'assistant', content: resp.content })
 
-    // Run all tools (sequentially — preserve order; flat list of results).
-    const toolResults: ToolResultBlockParam[] = []
-    for (const tu of toolUses) {
-      const out = await executeTool(tu.name, (tu.input ?? {}) as Record<string, unknown>)
-      toolResults.push({
-        type: 'tool_result',
-        tool_use_id: tu.id,
-        content: typeof out === 'string' ? out : JSON.stringify(out).slice(0, 8000),
-      })
-    }
+    // 同一轮里的多个工具调用并行跑：模型经常一次发 2~3 个（搜表 + 搜文档…），
+    // 串行的话每个都要等一次 lark-cli（约 0.9~1.3s）。结果按原顺序回填，
+    // tool_use_id 保证了对得上。
+    const toolResults: ToolResultBlockParam[] = await Promise.all(
+      toolUses.map(async (tu) => {
+        const out = await executeTool(tu.name, (tu.input ?? {}) as Record<string, unknown>)
+        return {
+          type: 'tool_result' as const,
+          tool_use_id: tu.id,
+          content: typeof out === 'string' ? out : JSON.stringify(out).slice(0, 8000),
+        }
+      }),
+    )
     messages.push({ role: 'user', content: toolResults })
   }
 

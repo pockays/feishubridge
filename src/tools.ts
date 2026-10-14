@@ -117,27 +117,47 @@ async function resolveDocUrl(token: string, kind?: string): Promise<string | nul
   const host = config.LARK_DOC_HOST.replace(/\/$/, '')
   if (/^https?:\/\//i.test(token)) return token
 
+  // 每次读都要反查一次的话，一次会话能白白多花好几秒（每次调用约 0.9s）；
+  // 同一个 token 的链接是稳定的，缓存住。
+  const cached = urlCache.get(token)
+  if (cached !== undefined) return cached
+
   const r = await runCli(['wiki', '+node-get', '--as', 'user', '--node-token', token, '--jq', '.data.node_token'])
   const nodeToken = typeof r.data === 'string' ? r.data.trim() : ''
-  if (r.ok && nodeToken) return `${host}/wiki/${nodeToken}`
+  if (r.ok && nodeToken) {
+    const url = `${host}/wiki/${nodeToken}`
+    urlCache.set(token, url)
+    return url
+  }
 
   switch (kind) {
     case 'SHEET':
     case 'sheet':
+      urlCache.set(token, `${host}/sheets/${token}`)
       return `${host}/sheets/${token}`
     case 'BITABLE':
     case 'bitable':
+      urlCache.set(token, `${host}/base/${token}`)
       return `${host}/base/${token}`
     case 'DOCX':
     case 'docx':
+      urlCache.set(token, `${host}/docx/${token}`)
       return `${host}/docx/${token}`
     default:
+      urlCache.set(token, null)
       return null
   }
 }
 
+const urlCache = new Map<string, string | null>()
+
 /** 列出工作簿的所有页签（名称 / id / 行列数 / 是否隐藏）。 */
 async function sheetDimensions(spreadsheet: string): Promise<SheetTab[]> {
+  // 页签结构变化很慢，但每次调用都要花约 0.9s（一次 lark-cli），
+  // 一次会话里往往要读好几次，缓存住。
+  const cached = tabCache.get(spreadsheet)
+  if (cached && Date.now() - cached.at < 5 * 60_000) return cached.tabs
+
   const r = await runCli([
     'sheets',
     '+workbook-info',
@@ -150,7 +170,7 @@ async function sheetDimensions(spreadsheet: string): Promise<SheetTab[]> {
     '.data.sheets | map({name: .sheet_name, id: .sheet_id, rows: .row_count, cols: .column_count, hidden: .is_hidden})',
   ])
   if (!r.ok || !Array.isArray(r.data)) return []
-  return (r.data as Array<Partial<SheetTab>>)
+  const tabs = (r.data as Array<Partial<SheetTab>>)
     .filter((s) => typeof s.name === 'string' && s.name)
     .map((s) => ({
       name: s.name ?? '',
@@ -159,7 +179,11 @@ async function sheetDimensions(spreadsheet: string): Promise<SheetTab[]> {
       cols: s.cols ?? 0,
       hidden: s.hidden === true,
     }))
+  tabCache.set(spreadsheet, { at: Date.now(), tabs })
+  return tabs
 }
+
+const tabCache = new Map<string, { at: number; tabs: SheetTab[] }>()
 
 /** 1 → A, 27 → AA（读整页时用来算末列）。 */
 function columnLetter(n: number): string {
@@ -457,14 +481,23 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'lark_search_in_sheet',
     description:
-      'Find a value inside a Feishu spreadsheet and return its cell address (e.g. B15 in tab 活动). This is the tool for "这个 ID / 活动 / 道具在哪张表" — the document search only indexes titles, so a row like 公会KVM[公][限] is invisible to it. Pass sheet_name to scan one tab, or omit it to scan every visible tab of the workbook.',
+      'Find a value inside a Feishu spreadsheet and return its cell address (e.g. B15 in tab 活动). This is the tool for "这个 ID / 活动 / 道具在哪张表" — the document search only indexes titles, so a row like 公会KVM[公][限] is invisible to it. IMPORTANT: pass sheet_name whenever you can guess the tab (道具/活动/装备… — get the list from lark_sheet_info); one tab takes ~1s while a 38-tab workbook takes ~20s. Omit sheet_name only when you really have no idea where to look.',
     input_schema: {
       type: 'object',
       properties: {
         spreadsheet: { type: 'string', description: 'Spreadsheet URL or token' },
         find: { type: 'string', description: 'Text to look for (whole or partial cell content)' },
-        sheet_name: { type: 'string', description: 'Optional: restrict the scan to one tab' },
+        sheet_name: {
+          type: 'string',
+          description:
+            'Restrict the scan to one tab — strongly preferred when you can guess it (≈20x faster than scanning the whole workbook).',
+        },
         match_case: { type: 'boolean', description: 'Case-sensitive match (default false)' },
+        max_matches: {
+          type: 'number',
+          description:
+            'Stop scanning once this many matches are found (default 10, max 50). Scanning every tab of a big workbook costs ~1s per tab, so keep this small unless you truly need exhaustiveness.',
+        },
       },
       required: ['spreadsheet', 'find'],
     },
@@ -511,19 +544,26 @@ export const TOOLS: ToolDef[] = [
       const tabs = (await sheetDimensions(target)).filter((s) => !s.hidden).slice(0, 40)
       if (tabs.length === 0) return { error: '读不到工作表列表' }
 
+      // 整本扫描是 N 次 API 调用（每个页签一次，各约 1 秒），找到足够结果就停，
+      // 不必把 30 多个页签全扫完 —— 实测这一条能把 11 秒压到 3~4 秒。
+      const maxMatches = Math.max(1, Math.min(50, numOpt(input, 'max_matches') ?? 10))
       const matches: Array<{ sheet: string; address: string; value: string }> = []
-      const CHUNK = 4
-      for (let i = 0; i < tabs.length && matches.length < 50; i += CHUNK) {
+      let scanned = 0
+      const CHUNK = 6
+      for (let i = 0; i < tabs.length && matches.length < maxMatches; i += CHUNK) {
         const batch = tabs.slice(i, i + CHUNK)
+        scanned += batch.length
         const results = await Promise.all(batch.map((t) => searchTab(t.name)))
         for (const group of results) matches.push(...group)
       }
 
       return withUrl({
         find,
-        scanned_tab_count: tabs.length,
+        scanned_tab_count: scanned,
+        total_tabs: tabs.length,
+        stopped_early: scanned < tabs.length,
         match_count: matches.length,
-        matches: matches.slice(0, 50),
+        matches: matches.slice(0, maxMatches),
       })
     },
   },

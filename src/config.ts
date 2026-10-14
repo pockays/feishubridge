@@ -195,6 +195,14 @@ const Env = z.object({
    */
   LARK_DOC_HOST: z.string().min(1).default('https://thedream.feishu.cn'),
 
+  /**
+   * 同时最多允许几个 lark-cli 子进程。飞书云空间接口的频控是 5 QPS，而模型
+   * 一轮里可能发多个工具调用、每个工具内部又自己并发，所以这里设一个**全局**
+   * 闸门，避免瞬时打爆被回 99991400（实测并发 12 时会触发，退避重试虽然能兜住
+   * 但要白等 1 秒多）。顺带约束内存：每个子进程约 30~50MB，容器上限 384MB。
+   */
+  LARK_CLI_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
+
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 })
 
