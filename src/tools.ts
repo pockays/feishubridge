@@ -303,7 +303,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'lark_search_docs',
     description:
-      'Search Feishu documents, wiki nodes and spreadsheets by keyword (runs with the operator\'s own permission scope, so results match what they can see in Feishu). Returns {total, returned, has_more, results[]}: `total` is the FULL number of matches — always quote it when the user asks "how many"; `results` is only the page you asked for (≤20 per page, and the tool pages through automatically when limit > 20, up to 5 pages). Each item has title, type, url, token, snippet — the `url` is a working Feishu link, include it in your answer whenever you mention that document. Use this first when the user asks "where is X documented" or wants to find a config table by name/id.',
+      'Search the WHOLE drive (documents, wiki nodes, spreadsheets) by keyword — runs with the operator\'s own permission scope. Returns {scope, total, returned, has_more, results[]}: `total` counts DOCUMENTS (one row per file whose title/snippet matched) — it is NOT a cell count; always quote it when the user asks "how many", and say that it is a document count. `results` is only the page you asked for (≤20/page, auto-paged up to 5 pages when limit > 20). Each item has title, type, url, token, snippet — include the `url` in your answer whenever you mention that file. Use this first when the user asks "where is X documented" or wants to find a config table by name/id.',
     input_schema: {
       type: 'object',
       properties: {
@@ -377,6 +377,7 @@ export const TOOLS: ToolDef[] = [
       }
 
       return {
+        scope: 'documents (whole drive: title/snippet match, one row per document)',
         total,
         returned: collected.length,
         has_more: hasMore,
@@ -481,7 +482,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'lark_search_in_sheet',
     description:
-      'Find a value inside a Feishu spreadsheet and return its cell address (e.g. B15 in tab 活动). This is the tool for "这个 ID / 活动 / 道具在哪张表" — the document search only indexes titles, so a row like 公会KVM[公][限] is invisible to it. IMPORTANT: pass sheet_name whenever you can guess the tab (道具/活动/装备… — get the list from lark_sheet_info); one tab takes ~1s while a 38-tab workbook takes ~20s. Omit sheet_name only when you really have no idea where to look.',
+      'Find a value inside ONE Feishu spreadsheet and return its cell address (e.g. B15 in tab 活动). Its `match_count` counts CELLS in that single workbook — never present it as a whole-drive count, and remember the same document often has several copies (…副本 / 原版 / 第三份), each of which must be scanned separately. This is the tool for "这个 ID / 活动 / 道具在哪张表" — the document search only indexes titles, so a row like 公会KVM[公][限] is invisible to it. IMPORTANT: pass sheet_name whenever you can guess the tab (道具/活动/装备… — get the list from lark_sheet_info); one tab takes ~1s while a 38-tab workbook takes ~20s. Omit sheet_name only when you really have no idea where to look.',
     input_schema: {
       type: 'object',
       properties: {
@@ -570,6 +571,7 @@ export const TOOLS: ToolDef[] = [
 
       const stoppedEarly = scanned < tabs.length
       return withUrl({
+        scope: 'cells (this ONE workbook only; one row per matching cell)',
         find,
         scanned_tab_count: scanned,
         total_tabs: tabs.length,
@@ -682,6 +684,119 @@ export const TOOLS: ToolDef[] = [
       return r.ok
         ? r.data
         : { error: r.stderr || r.raw, exit: r.exitCode, risk, identity }
+    },
+  },
+  {
+    name: 'lark_search_all',
+    description:
+      'ONE-SHOT MULTI-SOURCE SEARCH — the default entry point when the user says 搜索 / 查一下 / 有没有关于 X / X 在哪. It fans out to every source the operator can see and reports them separately: (1) documents + wiki nodes + spreadsheets by title/snippet (whole drive, `documents.total` = document count), (2) chat records (`messages.total` + samples with sender/time/chat), (3) the actual CELL contents of the most relevant spreadsheet(s) (`sheet_cells`). Never present one source\'s number as the overall total — quote each with its scope. Follow up with lark_read_sheet / lark_doc_read / lark_chat_messages_list to drill in.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Keyword, e.g. 挂鱼 / KVM / 无限之境' },
+        max_per_source: {
+          type: 'number',
+          description: 'How many hits to return per source (default 5, max 15). Counts are unaffected.',
+        },
+        scan_sheet_cells: {
+          type: 'boolean',
+          description:
+            'Also scan cell contents of the most relevant spreadsheet(s). Default true. Each workbook scan costs ~10s, so keep max_sheets small.',
+        },
+        max_sheets: {
+          type: 'number',
+          description: 'How many candidate workbooks to scan cell-by-cell (default 1, max 3).',
+        },
+      },
+      required: ['query'],
+    },
+    run: async (input) => {
+      const query = str(input, 'query')
+      const per = Math.max(1, Math.min(15, numOpt(input, 'max_per_source') ?? 5))
+      const scanCells = input.scan_sheet_cells !== false
+      const maxSheets = Math.max(1, Math.min(3, numOpt(input, 'max_sheets') ?? 1))
+
+      // ① 文档 / 知识库 / 表格（标题与片段）+ ② 聊天记录，并行跑
+      const [docRaw, msgRaw] = await Promise.all([
+        executeTool('lark_search_docs', { query, limit: per }),
+        executeTool('lark_search_messages', { query, limit: per }),
+      ])
+
+      const docRes = docRaw as {
+        total?: number
+        returned?: number
+        results?: Array<{ title: string; type: string; url: string; token: string; snippet?: string }>
+      } | null
+      // 注意：lark_search_messages 返回的是 CLI 的原始信封 {ok, identity, data:{messages,…}}，
+      // 消息数组在 data.data.messages（踩过：直接读 .messages 会永远得到 0 条）。
+      const msgEnv = msgRaw as {
+        messages?: Array<Record<string, unknown>>
+        has_more?: boolean
+        data?: { messages?: Array<Record<string, unknown>>; has_more?: boolean }
+      } | null
+      const msgList = msgEnv?.data?.messages ?? msgEnv?.messages ?? []
+      const msgHasMore = msgEnv?.data?.has_more ?? msgEnv?.has_more ?? false
+
+      const out: Record<string, unknown> = {
+        query,
+        documents: {
+          scope: 'whole drive — title/snippet match, one row per document/wiki/sheet',
+          total: docRes?.total ?? null,
+          returned: docRes?.returned ?? (docRes?.results ?? []).length,
+          top: (docRes?.results ?? []).slice(0, per),
+        },
+        messages: {
+          scope: 'chat records the operator is part of',
+          count: msgList.length,
+          has_more: msgHasMore,
+          samples: msgList.slice(0, per).map((m) => ({
+            chat: m.chat_name ?? m.chat_id,
+            from: (m.sender as { name?: string } | undefined)?.name,
+            time: m.create_time,
+            text: String(m.content ?? '').slice(0, 200),
+          })),
+        },
+      }
+
+      // ③ 表内单元格：从文档命中里挑最相关的表格，逐本扫（scan_all=扫完所有页签）
+      if (scanCells) {
+        const candidates = (docRes?.results ?? [])
+          .filter((r) => /sheet|bitable/i.test(String(r.type ?? '')))
+          .slice(0, maxSheets)
+        const scans = await Promise.all(
+          candidates.map(async (c) => {
+            const cellRaw = await executeTool('lark_search_in_sheet', {
+              spreadsheet: c.token || c.url,
+              find: query,
+              scan_all: true,
+            })
+            const cell = cellRaw as {
+              match_count?: number
+              scanned_tab_count?: number
+              total_tabs?: number
+              url?: string
+              matches?: unknown[]
+              error?: string
+            } | null
+            return {
+              workbook: c.title,
+              url: cell?.url ?? c.url,
+              cell_matches: cell?.match_count ?? 0,
+              scanned_tabs: `${cell?.scanned_tab_count ?? 0}/${cell?.total_tabs ?? 0}`,
+              ...(cell?.error ? { error: cell.error } : {}),
+              hits: (cell?.matches ?? []).slice(0, per),
+            }
+          }),
+        )
+        out.sheet_cells = {
+          scope: 'cell contents — only the workbook(s) listed here were scanned',
+          scanned_workbooks: scans,
+        }
+      }
+
+      out.note =
+        '三个来源的口径不同：documents.total 是文档篇数，messages.count 是本次取回的聊天条数，sheet_cells 只覆盖上面列出的表格。回答时请分别标明，不要把某一个数字说成"总数"。'
+      return out
     },
   },
 ]
