@@ -1,6 +1,7 @@
 import { config } from './config.js'
 import { logger } from './logger.js'
 import { startConsumer } from './lark/consume.js'
+import { runCli } from './lark/cli.js'
 import { respond as respondApi, respondImage as respondImageApi, recall } from './lark/reply.js'
 import { react, unreact } from './lark/reactions.js'
 import { extractLocalImages } from './lark/images.js'
@@ -14,7 +15,7 @@ import { RateLimiter } from './rate-limit.js'
 import { downloadResource } from './lark/download.js'
 import { startMetricsServer, metrics } from './metrics.js'
 import { parseCommand, isSandboxOff } from './commands.js'
-import type { FeishuMessageEvent } from './lark/types.js'
+import { isFeishuMessageEvent, type FeishuMessageEvent } from './lark/types.js'
 
 /**
  * 回复的呈现形式由 config.RESPONSE_MODE 决定：
@@ -143,6 +144,47 @@ function parseList(s: string): Set<string> {
  */
 const inflight = new Map<string, AbortController>()
 
+/**
+ * 每个会话当前正在处理的那一轮（key = chat_id）。
+ *
+ * 用途一：用户在机器人查询期间又发了一条 → 掐掉旧的一轮，只回答最新的那条，
+ *         不用排队等旧查询跑完。
+ * 用途二：用户撤回了消息（需订阅 im.message.recalled_v1）→ 掐掉对应那一轮
+ *         并且**不回复**。
+ */
+const activeTurns = new Map<string, { abort: AbortController; messageId: string }>()
+
+/** 撤回事件的处理入口（由第二个事件消费者调用）。 */
+export function cancelTurnForMessage(chatId: string, messageId: string): void {
+  const turn = activeTurns.get(chatId)
+  if (!turn) return
+  if (turn.messageId !== messageId) return
+  logger.info({ chat: chatId, messageId }, 'message recalled, cancelling the in-flight turn')
+  turn.abort.abort()
+}
+
+interface RecalledEvent {
+  chatId: string
+  messageId: string
+}
+
+/**
+ * 解析撤回事件。lark-cli 可能把字段平铺在根上，也可能包在 `event` 里，
+ * 两种都认（订阅后才能拿到真实结构，先写宽松些）。
+ */
+function parseRecallEvent(v: unknown): RecalledEvent | null {
+  if (typeof v !== 'object' || v === null) return null
+  const root = v as Record<string, unknown>
+  const inner =
+    typeof root.event === 'object' && root.event !== null
+      ? (root.event as Record<string, unknown>)
+      : root
+  const messageId = inner.message_id ?? root.message_id
+  const chatId = inner.chat_id ?? root.chat_id
+  if (typeof messageId !== 'string' || typeof chatId !== 'string') return null
+  return { chatId, messageId }
+}
+
 function prune(): void {
   const removed = store.pruneSeenEvents(config.SEEN_EVENT_TTL_DAYS * 24 * 3600 * 1000)
   if (removed > 0) logger.debug({ removed }, 'pruned seen_events')
@@ -211,6 +253,27 @@ export function normalizePostContent(content: string): string {
 }
 
 async function handle(evt: FeishuMessageEvent): Promise<void> {
+  // 新一轮到了：同一会话里还没跑完的那轮直接掐掉（用户连发消息只答最新一条）。
+  const prev = activeTurns.get(evt.chat_id)
+  if (prev && prev.messageId !== evt.message_id) {
+    logger.info(
+      { chat: evt.chat_id, cancelled: prev.messageId, replacedBy: evt.message_id },
+      'newer message arrived, aborting the in-flight turn',
+    )
+    prev.abort.abort()
+  }
+
+  const turnAbort = new AbortController()
+  activeTurns.set(evt.chat_id, { abort: turnAbort, messageId: evt.message_id })
+  try {
+    await handleInner(evt, turnAbort.signal)
+  } finally {
+    const cur = activeTurns.get(evt.chat_id)
+    if (cur?.abort === turnAbort) activeTurns.delete(evt.chat_id)
+  }
+}
+
+async function handleInner(evt: FeishuMessageEvent, signal: AbortSignal): Promise<void> {
   const isGroup = evt.chat_type === 'group'
   const rawContent = String(evt.content ?? '')
 
@@ -264,7 +327,7 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
       metrics.messagesDropped.inc({ reason: 'group_filter' })
       return
     }
-    await handleTextMessage(evt, text)
+    await handleTextMessage(evt, text, signal)
     return
   }
 
@@ -290,11 +353,15 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
   }
 
   // 普通文本消息：走与 post 共用的文本处理路径。
-  await handleTextMessage(evt, isGroup ? stripMention(rawContent) : rawContent)
+  await handleTextMessage(evt, isGroup ? stripMention(rawContent) : rawContent, signal)
 }
 
 /** 文本与富文本（post）共用的处理路径：群过滤 → 斜杠命令 → 会话历史 → 模型。 */
-async function handleTextMessage(evt: FeishuMessageEvent, rawText: string): Promise<void> {
+async function handleTextMessage(
+  evt: FeishuMessageEvent,
+  rawText: string,
+  signal?: AbortSignal,
+): Promise<void> {
   const isGroup = evt.chat_type === 'group'
 
   // Group filter.
@@ -385,12 +452,23 @@ async function handleTextMessage(evt: FeishuMessageEvent, rawText: string): Prom
   const history = store.history(evt.chat_id, config.MAX_HISTORY_TURNS * 2)
   const sdkStart = Date.now()
   try {
-    const result = await chat(history)
+    const result = await chat(history, signal ? { signal } : {})
+    if (result.aborted) {
+      // 被新消息顶掉 / 消息被撤回：这一轮不需要回复，把"敲键盘"表情撤掉就行
+      logger.info({ chat: evt.chat_id, messageId: evt.message_id }, 'turn aborted, reply dropped')
+      await clearAck(evt.message_id)
+      return
+    }
     body = result.text
     metrics.llmCalls.inc({ backend: 'anthropic-sdk', outcome: 'success' })
     metrics.llmLatencySec.observe({ backend: 'anthropic-sdk' }, (Date.now() - sdkStart) / 1000)
     metrics.llmToolCalls.inc({ backend: 'anthropic-sdk' }, result.toolCalls)
   } catch (err) {
+    if (signal?.aborted) {
+      logger.info({ chat: evt.chat_id }, 'turn aborted while calling the model, reply dropped')
+      await clearAck(evt.message_id)
+      return
+    }
     const e = err as { status?: number; message?: string }
     logger.error({ status: e.status, msg: e.message }, 'LLM call failed')
     body = `(调用模型失败: ${e.status ?? ''} ${e.message ?? String(err)})`
@@ -398,6 +476,13 @@ async function handleTextMessage(evt: FeishuMessageEvent, rawText: string): Prom
   }
 
   if (/[`*#>\-_]|\n/.test(body)) format = 'markdown'
+
+  // 最后一道闸：模型答完了但这期间用户已经发了新消息/撤回了，就别发这条了
+  if (signal?.aborted) {
+    logger.info({ chat: evt.chat_id, messageId: evt.message_id }, 'turn aborted before sending, reply dropped')
+    await clearAck(evt.message_id)
+    return
+  }
 
   store.appendMessage(evt.chat_id, 'assistant', body)
   await respond(evt, { messageId: evt.message_id, body, format })
@@ -802,6 +887,7 @@ export function run(): { stop: () => Promise<void> } {
   const { stop: stopMsgConsumer } = startConsumer({
     eventKey: config.LARK_EVENT_KEY,
     as: config.LARK_EVENT_AS,
+    parse: (v) => (isFeishuMessageEvent(v) ? v : null),
     onEvent: (evt) => {
       if (!store.claimEvent(evt.event_id)) {
         logger.debug({ event_id: evt.event_id }, 'duplicate event, skipped')
@@ -822,6 +908,36 @@ export function run(): { stop: () => Promise<void> } {
     stopCardConsumer = h.stop
   }
 
+  // 第三个消费者：消息撤回。用来取消正在跑的那一轮、并且不回复。
+  // 这个事件需要在开发者后台单独订阅并发版，所以先探测一次：不可用就只打警告，
+  // 不启动消费者（否则它每 2 秒重启一次，日志会被刷爆）。
+  let stopRecallConsumer: (() => Promise<void>) | undefined
+  if (config.ENABLE_RECALL_CANCEL) {
+    void runCli(
+      ['event', 'consume', config.LARK_RECALL_EVENT_KEY, '--as', 'bot', '--dry-run'],
+      20_000,
+      1,
+      { skipFormat: true },
+    ).then((probe) => {
+        if (!probe.ok) {
+          logger.warn(
+            { key: config.LARK_RECALL_EVENT_KEY, detail: (probe.stderr || probe.raw).slice(0, 160) },
+            '撤回事件未订阅：撤回取消暂不可用（开发者后台「事件与回调」订阅 im.message.recalled_v1 并发版即可生效）',
+          )
+          return
+        }
+        const h = startConsumer<RecalledEvent>({
+          eventKey: config.LARK_RECALL_EVENT_KEY,
+          as: 'bot',
+          parse: parseRecallEvent,
+          onEvent: (r) => cancelTurnForMessage(r.chatId, r.messageId),
+        })
+        stopRecallConsumer = h.stop
+        logger.info({ key: config.LARK_RECALL_EVENT_KEY }, 'recall-cancel consumer started')
+      },
+    )
+  }
+
   // Optional Prometheus /metrics endpoint, bound to localhost.
   let stopMetrics: (() => Promise<void>) | undefined
   if (config.METRICS_PORT > 0) {
@@ -834,6 +950,7 @@ export function run(): { stop: () => Promise<void> } {
       clearInterval(pruneTimer)
       await stopMsgConsumer()
       if (stopCardConsumer) await stopCardConsumer()
+      if (stopRecallConsumer) await stopRecallConsumer()
       if (stopMetrics) await stopMetrics()
       store.close()
     },

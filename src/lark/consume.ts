@@ -1,12 +1,17 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import readline from 'node:readline'
 import { logger } from '../logger.js'
-import { isFeishuMessageEvent, type FeishuMessageEvent } from './types.js'
 
-export interface ConsumeOptions {
+export interface ConsumeOptions<T> {
   eventKey: string
   as: 'bot' | 'user' | 'auto'
-  onEvent: (evt: FeishuMessageEvent) => void
+  /**
+   * 把原始 JSON 解析成业务事件；返回 null 表示"这不是我要的事件，丢掉"。
+   * 做成回调是因为不同 EventKey 的结构不同（消息事件 / 撤回事件 / …），
+   * 早先这里写死了 isFeishuMessageEvent，导致消费其它事件时全被丢掉。
+   */
+  parse: (v: unknown) => T | null
+  onEvent: (evt: T) => void
   /** Backoff between auto-restarts on unexpected exit. */
   restartDelayMs?: number
 }
@@ -35,7 +40,7 @@ export interface ConsumerHandle {
  *
  * Critical detail: stdin must remain an open pipe — see docs/architecture.md.
  */
-export function startConsumer(opts: ConsumeOptions): ConsumerHandle {
+export function startConsumer<T>(opts: ConsumeOptions<T>): ConsumerHandle {
   const restartDelayMs = opts.restartDelayMs ?? 2000
   let stopping = false
   let current: ChildProcessWithoutNullStreams | null = null
@@ -66,12 +71,13 @@ export function startConsumer(opts: ConsumeOptions): ConsumerHandle {
         logger.warn({ line: line.slice(0, 200) }, 'non-JSON line from lark-cli')
         return
       }
-      if (!isFeishuMessageEvent(parsed)) {
-        logger.debug({ parsed }, 'ignoring non-message event')
+      const evt = opts.parse(parsed)
+      if (evt === null) {
+        logger.debug({ parsed }, 'event did not match this consumer, ignored')
         return
       }
       try {
-        opts.onEvent(parsed)
+        opts.onEvent(evt)
       } catch (err) {
         logger.error({ err }, 'onEvent handler threw')
       }

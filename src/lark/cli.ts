@@ -34,11 +34,13 @@ export async function runCli(
   argv: string[],
   timeoutMs = 30_000,
   maxAttempts = RATE_LIMIT_ATTEMPTS,
+  opts: { skipFormat?: boolean } = {},
 ): Promise<CliResult> {
   const wantsFormat = argv.some(
     (a) => a === '--format' || a === '--json' || a === '--text' || a === '--ndjson',
   )
-  let finalArgv = wantsFormat ? argv : [...argv, '--format', 'json']
+  // 少数子命令（如 `event consume`）并不接受 --format，给它加会直接报 unknown flag
+  let finalArgv = wantsFormat || opts.skipFormat ? argv : [...argv, '--format', 'json']
   let env = process.env
 
   const asIdx = finalArgv.indexOf('--as')

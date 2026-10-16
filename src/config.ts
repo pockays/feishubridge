@@ -203,6 +203,17 @@ const Env = z.object({
    */
   LARK_CLI_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
 
+  /**
+   * 消息撤回事件。订阅后，用户撤回消息会取消正在跑的那一轮并且不回复。
+   * 注意：这需要在开发者后台「事件与回调」里订阅 `im.message.recalled_v1`
+   * 并**发版**才收得到；没订阅时桥会探测到并打印警告，不会反复重启消费者。
+   */
+  LARK_RECALL_EVENT_KEY: z.string().default('im.message.recalled_v1'),
+  ENABLE_RECALL_CANCEL: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 })
 

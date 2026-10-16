@@ -41,6 +41,12 @@ export interface ChatResult {
   outputTokens: number
   modelEcho: string
   toolCalls: number
+  /** 被取消（用户发了新消息 / 撤回了消息）时为 true，调用方不要再回复。 */
+  aborted?: boolean
+}
+
+export interface ChatOptions {
+  signal?: AbortSignal
 }
 
 const SYSTEM_PROMPT = `You are a helpful Feishu/Lark assistant connected to the user via a bot bridge. Reply in the same language as the user's message. When the user asks about specific chats, documents, or tables they have access to, use the provided tools to fetch real data rather than guessing.
@@ -60,7 +66,7 @@ Be economical with tools — this is a chat UI and the user is waiting:
 - The moment you have enough to answer, stop calling tools and write the answer.
 - If a tool returns nothing useful after two attempts, say so plainly instead of trying more variations.`
 
-export async function chat(history: ChatMessage[]): Promise<ChatResult> {
+export async function chat(history: ChatMessage[], opts: ChatOptions = {}): Promise<ChatResult> {
   // Anthropic SDK uses MessageParam[] which accepts string content for the
   // initial turns. We append tool-result turns as we loop.
   const messages: MessageParam[] = history.map((m) => ({
@@ -74,26 +80,78 @@ export async function chat(history: ChatMessage[]): Promise<ChatResult> {
   let finalText = ''
   let modelEcho = config.ANTHROPIC_MODEL
 
+  const aborted = (): boolean => opts.signal?.aborted === true
+  const abortedResult = (): ChatResult => ({
+    text: '',
+    inputTokens: totalIn,
+    outputTokens: totalOut,
+    modelEcho,
+    toolCalls,
+    aborted: true,
+  })
+
   for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+    // 用户又发了一条 / 撤回了这条 → 立刻停手，连工具都不用跑了
+    if (aborted()) {
+      logger.info({ iter, toolCalls }, 'turn aborted by a newer message or a recall')
+      return abortedResult()
+    }
     // 最后一轮不带工具：模型想再查也查不了，只能把已有信息整理成回答。
     const isLastIteration = iter === MAX_TOOL_ITERATIONS - 1
-    const resp = await client.messages.create({
-      model: config.ANTHROPIC_MODEL,
-      max_tokens: config.MAX_TOKENS_REPLY,
-      system: SYSTEM_PROMPT,
-      ...(config.ENABLE_TOOLS && !isLastIteration ? { tools: anthropicTools() } : {}),
-      messages,
-    })
+    // 重要（踩过）：最后一轮**不能**把 tools 从请求里去掉。历史里已经有
+    // tool_use / tool_result 块，模型看到"没有工具却又要接着调"，就会退化成
+    // 输出原始调用标记（DeepSeek 上必现），清洗后正文变空 → 用户收到兜底文案。
+    // 正确做法是继续带着工具定义，但用一句话要求它现在给结论。
+    const callMessages: MessageParam[] = isLastIteration
+      ? [
+          ...messages,
+          {
+            role: 'user',
+            content:
+              '（系统提示：工具调用次数已达上限，请立刻用已有信息给出最终回答，不要再调用任何工具。）',
+          },
+        ]
+      : messages
+    let resp: Awaited<ReturnType<typeof client.messages.create>>
+    try {
+      const reqOptions = opts.signal ? { signal: opts.signal } : {}
+      resp = await client.messages.create(
+        {
+          model: config.ANTHROPIC_MODEL,
+          max_tokens: config.MAX_TOKENS_REPLY,
+          system: SYSTEM_PROMPT,
+          ...(config.ENABLE_TOOLS ? { tools: anthropicTools() } : {}),
+          messages: callMessages,
+        },
+        reqOptions,
+      )
+    } catch (err) {
+      if (aborted()) {
+        logger.info({ iter }, 'request aborted mid-flight')
+        return abortedResult()
+      }
+      throw err
+    }
 
     totalIn += resp.usage.input_tokens
     totalOut += resp.usage.output_tokens
     modelEcho = resp.model
 
-    if (resp.stop_reason !== 'tool_use' || isLastIteration) {
+    if (resp.stop_reason !== 'tool_use') {
       finalText = extractText(resp.content)
       logger.debug(
         { iter, in: totalIn, out: totalOut, toolCalls, stop: resp.stop_reason, last: isLastIteration },
         'chat done',
+      )
+      break
+    }
+
+    // 最后一轮它还是想调工具：不再执行，取它写出来的正文收尾。
+    if (isLastIteration) {
+      finalText = extractText(resp.content).replace(/^\(empty response\)$/, '')
+      logger.warn(
+        { iter, toolCalls, wanted: resp.content.filter((b) => b.type === 'tool_use').length },
+        'still asked for tools on the final iteration, answering with what we have',
       )
       break
     }
@@ -109,6 +167,12 @@ export async function chat(history: ChatMessage[]): Promise<ChatResult> {
       (b): b is ToolUseBlock => b.type === 'tool_use',
     )
     toolCalls += toolUses.length
+
+    // 模型刚给出工具调用，但这期间用户已经发了新消息 → 不要再执行了
+    if (aborted()) {
+      logger.info({ iter, toolCalls }, 'aborted before executing tools')
+      return abortedResult()
+    }
 
     // Echo the assistant turn verbatim so the next request has full context.
     messages.push({ role: 'assistant', content: resp.content })
@@ -138,24 +202,33 @@ export async function chat(history: ChatMessage[]): Promise<ChatResult> {
     finalText = sanitized.text
   }
 
-  if (!finalText && sanitized.hadMarkup && config.ENABLE_TOOLS) {
+  if (aborted()) return abortedResult()
+
+  if (!finalText && sanitized.hadMarkup) {
     try {
+      // 用一个**干净的最小上下文**重新问一次：不带任何 tool_use / tool_result。
+      // 复用原来的 messages 会再次把模型带进"工具模式"、继续吐标记（实测三次都这样）。
+      const lastUser = [...history].reverse().find((m) => m.role === 'user')?.content ?? ''
       const retry = await client.messages.create({
         model: config.ANTHROPIC_MODEL,
         max_tokens: config.MAX_TOKENS_REPLY,
         system: SYSTEM_PROMPT,
         messages: [
-          ...messages,
           {
             role: 'user',
             content:
-              '你上一条回复只输出了工具调用的标记，没有正文。请直接用自然语言把答案写给用户，不要再输出任何标记。',
+              `用户的问题：${lastUser}\n\n` +
+              '（请直接用自然语言回答这个问题，不要输出任何工具调用标记，也不要调用工具。）',
           },
         ],
       })
       totalIn += retry.usage.input_tokens
       totalOut += retry.usage.output_tokens
       finalText = stripToolMarkup(extractText(retry.content)).text
+      logger.info(
+        { recoveredChars: finalText.length, toolCalls },
+        'recovered a prose answer with a clean context after markup leak',
+      )
     } catch (err) {
       logger.error({ err: (err as Error).message }, 'recovery call after leaked markup failed')
     }
@@ -163,7 +236,7 @@ export async function chat(history: ChatMessage[]): Promise<ChatResult> {
 
   if (!finalText || finalText === '(empty response)') {
     finalText =
-      '我查了几轮还没能给出结论（工具调用次数用尽）。可以再问一次，或者把范围说具体一点——比如直接给我文档/表格的名字。'
+      '这次我没能组织出回答（模型连续输出无效内容）。可以再问一次，或者把范围说具体一点——比如直接给我文档/表格的名字。'
   }
 
   return {

@@ -799,6 +799,94 @@ export const TOOLS: ToolDef[] = [
       return out
     },
   },
+  {
+    name: 'lark_doc_insert_image',
+    description:
+      'Insert an IMAGE into a Feishu docx in ONE call: downloads it from a chat message when needed, then inserts it into the document. Use it whenever the user says 把这张图/截图存进文档、把消息里的图插到文档里. Give (message_id + file_key) for an image living in a chat message, or `file` for a path already on the server. Returns block_id — that is the proof the image really landed (writing only the text is the usual failure mode).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        document: { type: 'string', description: 'Target docx URL or document_id' },
+        message_id: { type: 'string', description: 'Message carrying the image (om_…)' },
+        file_key: { type: 'string', description: 'Image file key from that message (img_v3_…)' },
+        file: { type: 'string', description: 'Local path on the server, if the image is already there' },
+        caption: { type: 'string', description: 'Optional caption' },
+      },
+      required: ['document'],
+    },
+    run: async (input) => {
+      const document = str(input, 'document')
+      const messageId = strOpt(input, 'message_id')
+      const fileKey = strOpt(input, 'file_key')
+      const caption = strOpt(input, 'caption')
+      let path = strOpt(input, 'file')
+      let downloaded: Record<string, unknown> | undefined
+
+      if (!path) {
+        if (!messageId || !fileKey) {
+          return { error: '需要 file（服务器上的路径），或者 message_id + file_key（消息里的图）' }
+        }
+        const out = `/tmp/lark-img-${Date.now()}`
+        const dl = await runCli(
+          [
+            'im',
+            '+messages-resources-download',
+            '--as',
+            'user',
+            '--message-id',
+            messageId,
+            '--file-key',
+            fileKey,
+            '--type',
+            'image',
+            '--output',
+            out,
+          ],
+          60_000,
+        )
+        if (!dl.ok) {
+          return { error: '从消息里下载图片失败', detail: (dl.stderr || dl.raw).slice(0, 400) }
+        }
+        const env = dl.data as { data?: { saved_path?: string; size_bytes?: number } } | null
+        path = env?.data?.saved_path || out
+        downloaded = { saved_path: path, bytes: env?.data?.size_bytes ?? null }
+      }
+
+      const argv = [
+        'docs',
+        '+media-insert',
+        '--as',
+        'user',
+        '--doc',
+        document,
+        '--file',
+        path,
+        '--type',
+        'image',
+      ]
+      if (caption) argv.push('--caption', caption)
+      const ins = await runCli(argv, 120_000)
+      if (!ins.ok) {
+        return {
+          error: '插入图片失败',
+          ...(downloaded ? { downloaded } : {}),
+          detail: (ins.stderr || ins.raw).slice(0, 400),
+        }
+      }
+      const info = (
+        ins.data as { data?: { block_id?: string; file_token?: string; document_id?: string } } | null
+      )?.data
+      const docId = info?.document_id
+      return {
+        ok: true,
+        inserted: true,
+        block_id: info?.block_id ?? null,
+        file_token: info?.file_token ?? null,
+        ...(docId ? { url: `${config.LARK_DOC_HOST.replace(/\/$/, '')}/docx/${docId}` } : {}),
+        ...(downloaded ? { downloaded } : {}),
+      }
+    },
+  },
 ]
 
 export const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]))
