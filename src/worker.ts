@@ -197,6 +197,19 @@ function stripMention(content: string): string {
   return s
 }
 
+/**
+ * 富文本（post）消息：lark-cli 已经把内容渲染成可读文本，但图片是
+ * `![Image](img_v3_xxx)` 这种占位符。模型看不了图片，留着这些 key 只会让它
+ * 瞎猜，所以换成一句说明。
+ */
+export function normalizePostContent(content: string): string {
+  const images = content.match(/!\[[^\]]*\]\(img_[^)]+\)/g)?.length ?? 0
+  const withoutImages = content.replace(/!\[[^\]]*\]\(img_[^)]+\)/g, '').trim()
+  if (images === 0) return content
+  const note = `[这条消息里还有 ${images} 张图片，我暂时看不了图片内容；如果需要我读图，把图里的文字贴成文本给我]`
+  return withoutImages ? `${withoutImages}\n\n${note}` : note
+}
+
 async function handle(evt: FeishuMessageEvent): Promise<void> {
   const isGroup = evt.chat_type === 'group'
   const rawContent = String(evt.content ?? '')
@@ -242,7 +255,20 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
     return
   }
 
-  // Non-text payloads (audio / sticker / post …): politely tell
+  // 富文本（post）：lark-cli 已经渲染成可读文本（标题、正文、列表都在里面），
+  // 所以直接按文本处理 —— 飞书里粘贴带格式的内容、转发/引用消息都会变成 post，
+  // 之前一律拒绝会让用户莫名其妙收到"暂不支持"。
+  if (evt.message_type === 'post') {
+    const text = normalizePostContent(isGroup ? stripMention(rawContent) : rawContent)
+    if (!shouldHandle(evt)) {
+      metrics.messagesDropped.inc({ reason: 'group_filter' })
+      return
+    }
+    await handleTextMessage(evt, text)
+    return
+  }
+
+  // Non-text payloads (audio / sticker / interactive …): politely tell
   // the user we don't speak that yet. Surface to the log so operators
   // can see what's being silently refused.
   if (evt.message_type !== 'text') {
@@ -263,12 +289,20 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
     return
   }
 
+  // 普通文本消息：走与 post 共用的文本处理路径。
+  await handleTextMessage(evt, isGroup ? stripMention(rawContent) : rawContent)
+}
+
+/** 文本与富文本（post）共用的处理路径：群过滤 → 斜杠命令 → 会话历史 → 模型。 */
+async function handleTextMessage(evt: FeishuMessageEvent, rawText: string): Promise<void> {
+  const isGroup = evt.chat_type === 'group'
+
   // Group filter.
   if (!shouldHandle(evt)) {
     logger.debug(
       {
         chat: evt.chat_id,
-        preview: rawContent.slice(0, 40),
+        preview: rawText.slice(0, 40),
         thread: evt.thread_id,
         mentions: Array.isArray(evt.mentions) ? evt.mentions.length : 0,
       },
@@ -279,13 +313,10 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
   }
 
   if (isGroup) {
-    logger.trace({ chat: evt.chat_id, raw: rawContent.slice(0, 120) }, 'group raw content')
+    logger.trace({ chat: evt.chat_id, raw: rawText.slice(0, 120) }, 'group raw content')
   }
 
-  const userText = (isGroup ? stripMention(rawContent) : rawContent).slice(
-    0,
-    config.MAX_INPUT_CHARS,
-  )
+  const userText = rawText.slice(0, config.MAX_INPUT_CHARS)
   if (!userText.trim()) return
 
   // Functional slash-commands (/sandbox, /status, /new, /help, …) run a
