@@ -214,6 +214,21 @@ const Env = z.object({
     .default('true')
     .transform((v) => v === 'true'),
 
+  /** 用卡片（CardKit）代替纯文本回复：封面图 + 扫光状态 + 工具列表 + 统计 + 停止按钮。 */
+  CARD_KIT: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+
+  /** 卡片顶部的封面图 image_key（先上传一次，长期复用）。留空则不显示封面。 */
+  CARD_COVER_IMAGE_KEY: z.string().default(''),
+
+  /** 扫光刷新间隔（毫秒）。卡片实体单元素更新实测 ~350ms，低于这个值没有意义。 */
+  CARD_SHIMMER_INTERVAL_MS: z.coerce.number().int().min(150).default(340),
+
+  /** 统计行里的 ctx 占用需要模型上下文窗口大小。 */
+  MODEL_CONTEXT_TOKENS: z.coerce.number().int().positive().default(128000),
+
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 })
 

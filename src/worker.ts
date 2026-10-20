@@ -8,6 +8,7 @@ import { extractLocalImages } from './lark/images.js'
 import { buildCard, type CardPhase, type ToolEntry } from './lark/card.js'
 import { sendCardReply, CardPatcher } from './lark/card-send.js'
 import { startCardActionConsumer, type CardActionEvent } from './lark/card-action-consume.js'
+import { CardLive } from './lark/card-live.js'
 import { chat } from './llm.js'
 import { runClaudeCode, type ClaudeCodeProgress } from './llm-claude-code.js'
 import { Store } from './store.js'
@@ -451,14 +452,37 @@ async function handleTextMessage(
   let format: 'text' | 'markdown' = 'text'
   const history = store.history(evt.chat_id, config.MAX_HISTORY_TURNS * 2)
   const sdkStart = Date.now()
+
+  // 卡片模式：先建卡并发出去，再让模型跑；扫光/工具/统计实时写进这张卡。
+  let live: CardLive | null = null
+  if (config.CARD_KIT) {
+    live = await CardLive.start(evt.chat_id)
+    live?.startShimmer()
+  }
+
   try {
     const result = await chat(history, {
       ...(signal ? { signal } : {}),
       chatId: evt.chat_id,
+      ...(live
+        ? {
+            onProgress: (p) => {
+              if (p.lastTool) live?.addTool(p.lastTool.name, p.lastTool.brief, p.lastTool.ok)
+              live?.setStats({
+                inputTokens: p.inputTokens,
+                outputTokens: p.outputTokens,
+                cacheReadTokens: p.cacheReadTokens,
+                toolCalls: p.toolCalls,
+                model: config.ANTHROPIC_MODEL,
+              })
+            },
+          }
+        : {}),
     })
     if (result.aborted) {
       // 被新消息顶掉 / 消息被撤回：这一轮不需要回复，把"敲键盘"表情撤掉就行
       logger.info({ chat: evt.chat_id, messageId: evt.message_id }, 'turn aborted, reply dropped')
+      await live?.fail('（已取消：你发了新消息或撤回了这条）')
       await clearAck(evt.message_id)
       return
     }
@@ -469,6 +493,7 @@ async function handleTextMessage(
   } catch (err) {
     if (signal?.aborted) {
       logger.info({ chat: evt.chat_id }, 'turn aborted while calling the model, reply dropped')
+      await live?.fail('（已取消：你发了新消息或撤回了这条）')
       await clearAck(evt.message_id)
       return
     }
@@ -483,12 +508,19 @@ async function handleTextMessage(
   // 最后一道闸：模型答完了但这期间用户已经发了新消息/撤回了，就别发这条了
   if (signal?.aborted) {
     logger.info({ chat: evt.chat_id, messageId: evt.message_id }, 'turn aborted before sending, reply dropped')
+    await live?.fail('（已取消：你发了新消息或撤回了这条）')
     await clearAck(evt.message_id)
     return
   }
 
   store.appendMessage(evt.chat_id, 'assistant', body)
-  await respond(evt, { messageId: evt.message_id, body, format })
+  if (live) {
+    // 卡片模式：答案写进卡片正文，不再另发一条文本消息
+    await live.finish(body)
+    await clearAck(evt.message_id)
+  } else {
+    await respond(evt, { messageId: evt.message_id, body, format })
+  }
 }
 
 /**

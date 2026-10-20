@@ -49,6 +49,17 @@ export interface ChatOptions {
   signal?: AbortSignal
   /** 当前会话 id，工具可以用它把"当前对话"作为默认值（例如列出本会话最近消息）。 */
   chatId?: string
+  /** 每轮模型返回、每次工具调用后回调一次，供实时卡片展示进度。 */
+  onProgress?: (p: ChatProgress) => void
+}
+
+export interface ChatProgress {
+  phase: 'thinking' | 'running'
+  toolCalls: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  lastTool?: { name: string; brief: string; ok: boolean }
 }
 
 const SYSTEM_PROMPT = `You are a helpful Feishu/Lark assistant connected to the user via a bot bridge. Reply in the same language as the user's message. When the user asks about specific chats, documents, or tables they have access to, use the provided tools to fetch real data rather than guessing.
@@ -83,6 +94,7 @@ export async function chat(history: ChatMessage[], opts: ChatOptions = {}): Prom
   let toolCalls = 0
   let finalText = ''
   let modelEcho = config.ANTHROPIC_MODEL
+  let cacheRead = 0
 
   const aborted = (): boolean => opts.signal?.aborted === true
   const abortedResult = (): ChatResult => ({
@@ -139,7 +151,15 @@ export async function chat(history: ChatMessage[], opts: ChatOptions = {}): Prom
 
     totalIn += resp.usage.input_tokens
     totalOut += resp.usage.output_tokens
+    cacheRead += resp.usage.cache_read_input_tokens ?? 0
     modelEcho = resp.model
+    opts.onProgress?.({
+      phase: 'thinking',
+      toolCalls,
+      inputTokens: totalIn,
+      outputTokens: totalOut,
+      cacheReadTokens: cacheRead,
+    })
 
     if (resp.stop_reason !== 'tool_use') {
       finalText = extractText(resp.content)
@@ -188,6 +208,16 @@ export async function chat(history: ChatMessage[], opts: ChatOptions = {}): Prom
       toolUses.map(async (tu) => {
         const out = await executeTool(tu.name, (tu.input ?? {}) as Record<string, unknown>, {
           ...(opts.chatId ? { chatId: opts.chatId } : {}),
+        })
+        const brief = JSON.stringify(tu.input ?? {}).slice(0, 70)
+        const ok = !(out && typeof out === 'object' && 'error' in (out as Record<string, unknown>))
+        opts.onProgress?.({
+          phase: 'running',
+          toolCalls,
+          inputTokens: totalIn,
+          outputTokens: totalOut,
+          cacheReadTokens: cacheRead,
+          lastTool: { name: tu.name, brief, ok },
         })
         return {
           type: 'tool_result' as const,
