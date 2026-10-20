@@ -155,13 +155,25 @@ const inflight = new Map<string, AbortController>()
  */
 const activeTurns = new Map<string, { abort: AbortController; messageId: string }>()
 
+/** 被取消时给用户的说法，按取消原因区分。 */
+function abortText(signal?: AbortSignal): string {
+  switch (signal?.reason) {
+    case 'user-stop':
+      return '⏹ 已停止'
+    case 'recalled':
+      return '（消息已撤回，这一轮已取消）'
+    default:
+      return '（已取消：你发了新消息）'
+  }
+}
+
 /** 撤回事件的处理入口（由第二个事件消费者调用）。 */
 export function cancelTurnForMessage(chatId: string, messageId: string): void {
   const turn = activeTurns.get(chatId)
   if (!turn) return
   if (turn.messageId !== messageId) return
   logger.info({ chat: chatId, messageId }, 'message recalled, cancelling the in-flight turn')
-  turn.abort.abort()
+  turn.abort.abort('recalled')
 }
 
 interface RecalledEvent {
@@ -261,7 +273,7 @@ async function handle(evt: FeishuMessageEvent): Promise<void> {
       { chat: evt.chat_id, cancelled: prev.messageId, replacedBy: evt.message_id },
       'newer message arrived, aborting the in-flight turn',
     )
-    prev.abort.abort()
+    prev.abort.abort('superseded')
   }
 
   const turnAbort = new AbortController()
@@ -482,7 +494,7 @@ async function handleTextMessage(
     if (result.aborted) {
       // 被新消息顶掉 / 消息被撤回：这一轮不需要回复，把"敲键盘"表情撤掉就行
       logger.info({ chat: evt.chat_id, messageId: evt.message_id }, 'turn aborted, reply dropped')
-      await live?.fail('（已取消：你发了新消息或撤回了这条）')
+      await live?.fail(abortText(signal))
       await clearAck(evt.message_id)
       return
     }
@@ -493,7 +505,7 @@ async function handleTextMessage(
   } catch (err) {
     if (signal?.aborted) {
       logger.info({ chat: evt.chat_id }, 'turn aborted while calling the model, reply dropped')
-      await live?.fail('（已取消：你发了新消息或撤回了这条）')
+      await live?.fail(abortText(signal))
       await clearAck(evt.message_id)
       return
     }
@@ -508,7 +520,7 @@ async function handleTextMessage(
   // 最后一道闸：模型答完了但这期间用户已经发了新消息/撤回了，就别发这条了
   if (signal?.aborted) {
     logger.info({ chat: evt.chat_id, messageId: evt.message_id }, 'turn aborted before sending, reply dropped')
-    await live?.fail('（已取消：你发了新消息或撤回了这条）')
+    await live?.fail(abortText(signal))
     await clearAck(evt.message_id)
     return
   }
@@ -1018,11 +1030,18 @@ async function onCardAction(action: CardActionEvent): Promise<void> {
 
   if (name === 'stop') {
     const ctrl = inflight.get(action.messageId)
-    if (!ctrl) {
-      logger.info({ msg: action.messageId }, 'stop: no in-flight run for this card')
+    if (ctrl) {
+      ctrl.abort()
       return
     }
-    ctrl.abort()
+    // 卡片实体（CardKit）这条路径没有按 message_id 注册，按会话找正在进行的那一轮
+    const turn = activeTurns.get(action.chatId)
+    if (turn) {
+      logger.info({ chat: action.chatId, msg: action.messageId }, 'stop: aborting the in-flight turn')
+      turn.abort.abort('user-stop')
+      return
+    }
+    logger.info({ msg: action.messageId }, 'stop: no in-flight run for this card')
     return
   }
 
