@@ -452,7 +452,10 @@ async function handleTextMessage(
   const history = store.history(evt.chat_id, config.MAX_HISTORY_TURNS * 2)
   const sdkStart = Date.now()
   try {
-    const result = await chat(history, signal ? { signal } : {})
+    const result = await chat(history, {
+      ...(signal ? { signal } : {}),
+      chatId: evt.chat_id,
+    })
     if (result.aborted) {
       // 被新消息顶掉 / 消息被撤回：这一轮不需要回复，把"敲键盘"表情撤掉就行
       logger.info({ chat: evt.chat_id, messageId: evt.message_id }, 'turn aborted, reply dropped')

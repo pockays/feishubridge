@@ -29,12 +29,17 @@ export interface ToolDef {
     type: 'object'
     properties: Record<
       string,
-      { type: string; description: string; items?: { type: string }; enum?: string[] }
+      { type: string; description: string; items?: Record<string, unknown>; enum?: string[] }
     >
     required?: string[]
   }
-  /** Map input args to lark-cli argv. */
-  run: (input: Record<string, unknown>) => Promise<unknown>
+  /** Map input args to lark-cli argv. `ctx` 携带当前会话信息（chat_id 等）。 */
+  run: (input: Record<string, unknown>, ctx?: ToolContext) => Promise<unknown>
+}
+
+/** 当前这一轮的上下文，由桥注入；工具可用它把"当前会话"作为默认值。 */
+export interface ToolContext {
+  chatId?: string
 }
 
 function str(input: Record<string, unknown>, key: string): string {
@@ -237,8 +242,8 @@ export const TOOLS: ToolDef[] = [
         limit: { type: 'number', description: 'Max messages (1-50)' },
       },
     },
-    run: async (input) => {
-      const chatId = strOpt(input, 'chat_id')
+    run: async (input, ctx) => {
+      const chatId = strOpt(input, 'chat_id') ?? ctx?.chatId
       const userId = strOpt(input, 'user_id')
       if (!chatId && !userId) throw new Error('chat_id or user_id is required')
       const argv = ['im', '+chat-messages-list', '--as', 'user']
@@ -887,6 +892,193 @@ export const TOOLS: ToolDef[] = [
       }
     },
   },
+  {
+    name: 'lark_doc_insert_images',
+    description:
+      'Insert MANY images (with optional section headings) into a docx in ONE call — use this instead of calling lark_doc_insert_image in a loop, which burns the whole tool budget: 26 images would otherwise need 26 rounds. Pass groups, each with an optional `heading` (rendered as a Markdown H2). EASIEST: give the group a `message_id` and NO `images` — the tool pulls every image out of that message, in order. Otherwise pass `images: [{file_key, message_id?, file?, caption?}]`. Returns per-image ok/error so you can report precisely what landed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        document: { type: 'string', description: 'Target docx URL or document_id' },
+        groups: {
+          type: 'array',
+          description:
+            'Sections to append, in order. Example: [{"heading":"矿石icon","images":[{"message_id":"om_…","file_key":"img_v3_…","caption":"1/11"}]}]',
+          items: {
+            type: 'object',
+            properties: {
+              heading: { type: 'string', description: 'Optional H2 heading for this section' },
+              message_id: {
+                type: 'string',
+                description:
+                  'Optional: when `images` is omitted, pull EVERY image out of this message automatically (om_…).',
+              },
+              images: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    message_id: { type: 'string', description: 'Message carrying the image (om_…)' },
+                    file_key: { type: 'string', description: 'img_v3_… key from that message' },
+                    file: { type: 'string', description: 'Local path on the server instead of file_key' },
+                    caption: { type: 'string', description: 'Optional caption' },
+                  },
+                },
+              },
+            },
+            required: ['images'],
+          },
+        },
+      },
+      required: ['document', 'groups'],
+    },
+    run: async (input) => {
+      const document = str(input, 'document')
+      const rawGroups = input.groups
+      if (!Array.isArray(rawGroups)) throw new Error("tool input 'groups' must be an array")
+
+      const results: Array<Record<string, unknown>> = []
+      let inserted = 0
+      let failed = 0
+      let index = 0
+
+      for (const group of rawGroups as Array<Record<string, unknown>>) {
+        const heading = typeof group.heading === 'string' ? group.heading.trim() : ''
+        const groupMessageId = typeof group.message_id === 'string' ? group.message_id : ''
+        if (heading) {
+          const h = await runCli(
+            [
+              'docs',
+              '+update',
+              '--as',
+              'user',
+              '--doc',
+              document,
+              '--command',
+              'append',
+              '--doc-format',
+              'markdown',
+              '--content',
+              `## ${heading}`,
+            ],
+            60_000,
+          )
+          if (!h.ok) {
+            results.push({ heading, ok: false, error: (h.stderr || h.raw).slice(0, 200) })
+          }
+        }
+
+        let images = Array.isArray(group.images) ? (group.images as Array<Record<string, unknown>>) : []
+
+        // 只给了 message_id 时，自动把这条消息里的所有图片按顺序取出来
+        // （模型没必要自己枚举 26 个 file_key —— 它既容易漏，也会把轮数耗光）。
+        if (images.length === 0 && groupMessageId) {
+          const r = await runCli(
+            ['im', '+messages-mget', '--as', 'user', '--message-ids', groupMessageId],
+            60_000,
+          )
+          const env = r.data as
+            | { data?: { messages?: Array<{ content?: string }> }; messages?: Array<{ content?: string }> }
+            | null
+          const content = String(env?.data?.messages?.[0]?.content ?? env?.messages?.[0]?.content ?? '')
+          // 真实 key 形如 img_v3_0216h_aff30b8b-a3f2-...；要求中间带 "-"，
+          // 避免把正文里的占位写法（img_v3_0216l_...）误当成 key。
+          const keys = [...content.matchAll(/img_[A-Za-z0-9_]+-[A-Za-z0-9_-]{10,}/g)].map((m) => m[0])
+          images = keys.map((k) => ({ message_id: groupMessageId, file_key: k }))
+          if (images.length === 0) {
+            results.push({
+              heading: heading || null,
+              ok: false,
+              error: `消息 ${groupMessageId} 里没有找到图片（msg_type=${String((env?.data?.messages?.[0] as { msg_type?: string } | undefined)?.msg_type ?? '?')}）`,
+            })
+          }
+        }
+        for (const img of images) {
+          index += 1
+          if (index > 40) {
+            results.push({ index, ok: false, error: '超过单次 40 张上限，剩余未处理' })
+            failed += 1
+            continue
+          }
+          const messageId = typeof img.message_id === 'string' ? img.message_id : groupMessageId
+          const fileKey = typeof img.file_key === 'string' ? img.file_key : ''
+          const localFile = typeof img.file === 'string' ? img.file : ''
+          const caption = typeof img.caption === 'string' ? img.caption : ''
+
+          let path = localFile
+          if (!path) {
+            if (!messageId || !fileKey) {
+              results.push({ index, ok: false, error: '缺少 file 或 message_id+file_key' })
+              failed += 1
+              continue
+            }
+            const out = `/tmp/lark-img-${Date.now()}-${index}`
+            const dl = await runCli(
+              [
+                'im',
+                '+messages-resources-download',
+                '--as',
+                'user',
+                '--message-id',
+                messageId,
+                '--file-key',
+                fileKey,
+                '--type',
+                'image',
+                '--output',
+                out,
+              ],
+              60_000,
+            )
+            const saved = (dl.data as { data?: { saved_path?: string } } | null)?.data?.saved_path
+            if (!dl.ok || !saved) {
+              results.push({ index, ok: false, error: (dl.stderr || dl.raw).slice(0, 200) })
+              failed += 1
+              continue
+            }
+            path = saved
+          }
+
+          const argv = [
+            'docs',
+            '+media-insert',
+            '--as',
+            'user',
+            '--doc',
+            document,
+            '--file',
+            path,
+            '--type',
+            'image',
+          ]
+          if (caption) argv.push('--caption', caption)
+          const ins = await runCli(argv, 120_000)
+          if (ins.ok) {
+            inserted += 1
+            results.push({
+              index,
+              heading: heading || null,
+              ok: true,
+              block_id:
+                (ins.data as { data?: { block_id?: string } } | null)?.data?.block_id ?? null,
+            })
+          } else {
+            failed += 1
+            results.push({ index, ok: false, error: (ins.stderr || ins.raw).slice(0, 200) })
+          }
+        }
+      }
+
+      return {
+        ok: failed === 0,
+        document,
+        total: index,
+        inserted,
+        failed,
+        results: results.slice(0, 40),
+      }
+    },
+  },
 ]
 
 export const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]))
@@ -904,12 +1096,16 @@ export function anthropicTools(): Array<{
   }))
 }
 
-export async function executeTool(name: string, input: Record<string, unknown>): Promise<unknown> {
+export async function executeTool(
+  name: string,
+  input: Record<string, unknown>,
+  ctx?: ToolContext,
+): Promise<unknown> {
   const t = TOOL_MAP.get(name)
   if (!t) throw new Error(`unknown tool: ${name}`)
   logger.info({ tool: name, input }, 'executing tool')
   try {
-    const out = await t.run(input)
+    const out = await t.run(input, ctx)
     logger.debug({ tool: name }, 'tool ok')
     return out
   } catch (err) {

@@ -47,6 +47,8 @@ export interface ChatResult {
 
 export interface ChatOptions {
   signal?: AbortSignal
+  /** 当前会话 id，工具可以用它把"当前对话"作为默认值（例如列出本会话最近消息）。 */
+  chatId?: string
 }
 
 const SYSTEM_PROMPT = `You are a helpful Feishu/Lark assistant connected to the user via a bot bridge. Reply in the same language as the user's message. When the user asks about specific chats, documents, or tables they have access to, use the provided tools to fetch real data rather than guessing.
@@ -59,6 +61,8 @@ Be economical with tools — this is a chat UI and the user is waiting:
 - For spreadsheets: call lark_sheet_info to see the tab list before reading (they often have 30+ tabs), and use lark_search_in_sheet to locate a specific row/ID — never assume the first tab or a guessed range holds the answer.
 - 在表里找东西时用 lark_search_in_sheet，并且**尽量带上 sheet_name**：只扫一页约 1 秒，扫整本 38 页要 20 秒。猜得出大概在哪页（道具/活动/装备…）就先只扫那页；实在不知道再整本扫。不要反复换关键词重扫整本表，两次没找到就换策略或直接说明没找到。
 - 用户说「所有 / 全部 / 完整清单 / 都列出来」时，必须在调用 lark_search_in_sheet 时传 scan_all=true（默认只找到 10 条就停，会漏）。工具返回里 stopped_early=true 说明还有页签没扫完，这时要么用 scan_all 重扫，要么在回答里说明结果不完整。
+- **多张图要一次插完**：用 lark_doc_insert_images（一次调用可带多个分组、每组一个标题、组内多张图），**不要**逐张调 lark_doc_insert_image——26 张图那样会把工具轮数耗光。单张才用 lark_doc_insert_image。
+- lark_chat_messages_list **不传 chat_id 就默认当前会话**，不要为了拿 chat_id 去查 +chat-list。
 - **报数量时必须说清口径**：lark_search_docs 的 total 是**文档数**（全库，一篇算一条）；lark_search_in_sheet 的 match_count 是**单元格数**（而且只覆盖你指定的那一本表）。两者数字不同是正常的，不要互相替换着说。用户问"KVM 一共多少"这类问题时，把两个数都给出并标明范围，例如「全库文档 139 篇；《常用ID信息表》原版表内 75 个单元格」。
 - 同一份资料常有多份副本（…副本 / 原版 / 第三份），只扫一本就报"全部"是错的 —— 要么把相关副本都扫了，要么明确说只扫了哪一本。
 - When a task needs something the tools above do not cover (Bitable records, uploading files, writing cells, chat admin, whiteboards…), use lark_cli with the raw command array; it exposes every authorised Feishu CLI command. Irreversible commands are refused by the bridge — tell the user to do those by hand.
@@ -182,7 +186,9 @@ export async function chat(history: ChatMessage[], opts: ChatOptions = {}): Prom
     // tool_use_id 保证了对得上。
     const toolResults: ToolResultBlockParam[] = await Promise.all(
       toolUses.map(async (tu) => {
-        const out = await executeTool(tu.name, (tu.input ?? {}) as Record<string, unknown>)
+        const out = await executeTool(tu.name, (tu.input ?? {}) as Record<string, unknown>, {
+          ...(opts.chatId ? { chatId: opts.chatId } : {}),
+        })
         return {
           type: 'tool_result' as const,
           tool_use_id: tu.id,
